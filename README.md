@@ -21,7 +21,7 @@ $EDITOR ~/.claude/skills/validate-integration/config.json
 # 4. Start your IAP platform (this tool is built against itential-dev-stack)
 
 # 5. Validate a spec
-validate-integration /path/to/openapi.json
+validate-integration openapi.json
 ```
 
 This tool is designed to run against [itential-dev-stack](https://github.com/itential/itential-dev-stack) as the primary supported platform. Other Itential platform deployments may work if the REST API surface matches, but only the dev stack is regularly verified.
