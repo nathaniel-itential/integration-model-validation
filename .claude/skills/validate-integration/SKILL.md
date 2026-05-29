@@ -21,6 +21,7 @@ validate-integration <spec.json> [--cleanup] [--group <name>] [--json]      # si
 validate-integration fetch [<N> | --all] [--branch <name>]                  # pull specs from the assets repo
 validate-integration bulk [--rerun | --no-rerun] [--no-cleanup] [--group <name>] [--json]
 validate-integration status [--json]
+validate-integration clear [--all | --unvalidated | --validated | --partial | --failed] [--yes]
 ```
 
 The CLI exits with:
@@ -37,6 +38,7 @@ The CLI exits with:
 | "pull every spec we don't have yet" | `validate-integration fetch --all` |
 | "validate everything I haven't validated yet" | `validate-integration bulk` |
 | "what's the state of my spec folder?" | `validate-integration status` |
+| "delete local specs to start over" | `validate-integration clear --all` (or specific buckets) |
 
 The managed spec folder is `specs/` inside the repo (gitignored). Specs are sorted into `unvalidated/`, `validated/`, `partial/`, `failed/` after each run. Bare-path mode (single) leaves outside-folder specs in place; specs that already live under `specs/` get moved into the matching bucket on completion.
 
@@ -55,6 +57,9 @@ After bulk, look at the summary line counts. If `FAIL > 0`, offer to dig into a 
 
 ### status
 Trivial — just shows bucket counts and a sample listing per bucket.
+
+### clear
+Deletes local spec files from one or more buckets. The CLI prints a per-bucket count and prompts before deleting; pass `--yes` for non-interactive use. `clear` only touches the local file tree — imported models on the IAP stack are not affected (use `bulk --cleanup` to tear those down, or delete them in the platform UI).
 
 ## Presenting results
 

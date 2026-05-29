@@ -40,6 +40,7 @@ Usage:
   validate-integration fetch [<N> | --all] [--branch <name>]
   validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--group <name>] [--json]
   validate-integration status [--json]
+  validate-integration clear [--all | --unvalidated | --validated | --partial | --failed] [--yes]
 
 Run 'validate-integration help' for examples and flag details.
 EOF
@@ -53,6 +54,7 @@ USAGE
   validate-integration fetch <N|--all>         # pull specs from the assets repo
   validate-integration bulk [flags]            # validate every spec in unvalidated/
   validate-integration status                  # show bucket counts + listing
+  validate-integration clear <bucket-flags>    # delete local specs from buckets
   validate-integration help                    # this screen
 
 EXAMPLES
@@ -72,6 +74,11 @@ EXAMPLES
 
   # Drill into a specific failure after a bulk run
   validate-integration specs/failed/Akamai/akamai_api.json
+
+  # Wipe local buckets (does not touch the IAP stack)
+  validate-integration clear --all               # empty every bucket
+  validate-integration clear --failed --partial  # empty specific buckets
+  validate-integration clear --all --yes         # skip confirmation
 
 FLAGS
   Single-spec mode:
@@ -96,6 +103,14 @@ FLAGS
 
   status:
     --json            Emit JSON instead of the formatted listing
+
+  clear:
+    --all             Empty every bucket
+    --unvalidated     Empty unvalidated/
+    --validated       Empty validated/
+    --partial         Empty partial/
+    --failed          Empty failed/
+    --yes, -y         Skip the confirmation prompt (required for non-interactive use)
 
 EXIT CODES
   0   PASS (single) or no failures (bulk/fetch/status)
@@ -867,12 +882,71 @@ console.log(JSON.stringify({
   fi
 }
 
+cmd_clear() {
+  local clear_all=false yes=false
+  local -a wanted=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)         clear_all=true; shift ;;
+      --unvalidated) wanted+=(unvalidated); shift ;;
+      --validated)   wanted+=(validated); shift ;;
+      --partial)     wanted+=(partial); shift ;;
+      --failed)      wanted+=(failed); shift ;;
+      --yes|-y)      yes=true; shift ;;
+      -h|--help)     usage ;;
+      *)             echo "Unknown clear arg: $1" >&2; usage ;;
+    esac
+  done
+  if $clear_all; then
+    wanted=("${BUCKETS[@]}")
+  fi
+  if [ "${#wanted[@]}" -eq 0 ]; then
+    echo "clear: specify at least one of --all / --unvalidated / --validated / --partial / --failed" >&2
+    exit 2
+  fi
+
+  ensure_project_dirs
+
+  local total=0
+  echo "Will delete from:"
+  for b in "${wanted[@]}"; do
+    local n
+    n=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    printf '  %-13s %s spec(s)\n' "$b/" "$n"
+    total=$((total + n))
+  done
+  if [ "$total" -eq 0 ]; then
+    echo "Nothing to delete."
+    exit 0
+  fi
+
+  if ! $yes; then
+    if [ -t 0 ]; then
+      printf 'Delete %d file(s)? [y/N] ' "$total" >&2
+      read -r yn
+      case "$yn" in [yY]|[yY][eE][sS]) ;; *) echo "Cancelled." >&2; exit 0 ;; esac
+    else
+      echo "Refusing to delete noninteractively without --yes." >&2
+      exit 2
+    fi
+  fi
+
+  for b in "${wanted[@]}"; do
+    find "$PROJECT_ROOT/$b" -type f -name '*.json' -delete 2>/dev/null || true
+    # Prune empty subdirs (Vendor/Product/ trees) but keep the bucket root + .gitkeep
+    find "$PROJECT_ROOT/$b" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  done
+  echo "Cleared $total spec(s) from local buckets."
+  echo "Note: this only removes local files. Imported models on the IAP stack are unaffected."
+}
+
 # --------- dispatch ---------
 SUB="${1:-}"
 case "$SUB" in
   fetch)   shift; cmd_fetch "$@" ;;
   bulk)    shift; cmd_bulk "$@" ;;
   status)  shift; cmd_status "$@" ;;
+  clear)   shift; cmd_clear "$@" ;;
   help|-h|--help) print_help; exit 0 ;;
   "")      usage ;;
   *)       cmd_single "$@" ;;

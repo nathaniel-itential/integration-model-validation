@@ -56,9 +56,15 @@ validate-integration bulk --no-rerun        # skip the rerun prompt entirely
 validate-integration bulk --no-cleanup      # keep imported models around (default tears them down)
 
 validate-integration status                 # bucket counts + sample listing
+
+validate-integration clear --all             # delete every local spec (prompts first)
+validate-integration clear --failed          # wipe a specific bucket
+validate-integration clear --all --yes       # skip the confirmation
 ```
 
 Bulk runs delete each imported model and instance after validating, since accumulating many models slows the platform down significantly. Pass `--no-cleanup` if you want to keep them around for inspection.
+
+`clear` only removes the local spec files — integration models already imported into the IAP stack are not affected.
 
 Specs are identified by their `<Vendor>/<Product>/<file>.json` path. After bulk runs they're sorted into `specs/{validated,partial,failed}/`. You can drill into a single failure with the bare-path form:
 
