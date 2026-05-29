@@ -2,7 +2,8 @@
 
 End-to-end validator for OpenAPI specs intended for Itential integration models. Replaces the manual workflow of: import → create integration → grant role to group → open Studio → check the task palette.
 
-One command tells you whether a spec produces a working set of callable tasks.
+One command tells you whether a spec will successfully import into IAP, and the tasks populate in Studio. 
+This DOES NOT check for task structure/shape, nor does it validate authentication. 
 
 ## Quick start
 
@@ -65,12 +66,6 @@ Or in natural language: "use validate-integration on `/path/to/spec.json`."
 
 These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git.
 
-### A note on the credentials in this repo
-
-`admin@itential` / `admin` appear as literal values in `bin/validate-integration`, `install.sh`, and this README. These are the **publicly documented default credentials for a freshly installed Itential dev stack** — not production secrets. The dev stack runs locally on `localhost:3000`, has no external network exposure, and exists solely for developer testing.
-
-This tool is designed to work *only* against that dev stack. If your organization has changed the defaults or is targeting a different stack, edit `~/.claude/skills/validate-integration/config.json` after install. Automated secret scanners may flag these values; they are intentional and acceptable for this tool's scope.
-
 ## What this validates
 
 The CLI runs six stages, each producing a ✓ or ✗ in the report:
@@ -89,8 +84,6 @@ The CLI runs six stages, each producing a ✓ or ✗ in the report:
 - Whether the spec describes the *real* vendor API correctly. Platform validation is structural, not semantic.
 - Whether configured auth credentials work against the real upstream. Instance is created with `virtual: true`.
 - Whether individual tasks execute end-to-end against a real vendor.
-
-For vendor-accuracy testing, layer this with a Prism mock + a real-vendor smoke call on critical endpoints.
 
 ## Repo layout
 
