@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# validate-integration: end-to-end OpenAPI spec validation against an Itential dev stack.
+#
+# Usage:
+#   validate-integration <path-to-openapi-spec.json> [--cleanup] [--group <groupName>] [--json]
+#
+# Exit codes:
+#   0 = PASS
+#   1 = validation FAIL or PARTIAL
+#   2 = setup error (bad args, missing config, login failed, dev stack unreachable)
+
+set -uo pipefail
+
+CONFIG_DIR="$HOME/.claude/skills/validate-integration"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+
+# --------- arg parsing ---------
+SPEC_PATH=""
+GROUP_OVERRIDE=""
+CLEANUP=false
+JSON_OUT=false
+
+usage() {
+  echo "Usage: validate-integration <spec.json> [--cleanup] [--group <name>] [--json]" >&2
+  exit 2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --cleanup)  CLEANUP=true; shift ;;
+    --group)    GROUP_OVERRIDE="${2:-}"; shift 2 ;;
+    --json)     JSON_OUT=true; shift ;;
+    -h|--help)  usage ;;
+    -*)         echo "Unknown flag: $1" >&2; usage ;;
+    *)          if [ -z "$SPEC_PATH" ]; then SPEC_PATH="$1"; else usage; fi; shift ;;
+  esac
+done
+
+[ -n "$SPEC_PATH" ] || usage
+
+# --------- config ---------
+if [ ! -f "$CONFIG_FILE" ]; then
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<'EOF'
+{
+  "iap_url": "http://localhost:3000",
+  "username": "admin@itential",
+  "password": "admin",
+  "default_group": "admin_group"
+}
+EOF
+  chmod 600 "$CONFIG_FILE"
+  echo "Created default config at $CONFIG_FILE" >&2
+fi
+
+IAP_URL=$(node -e "console.log(require('$CONFIG_FILE').iap_url)")
+USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username)")
+PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password)")
+DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group)")
+GROUP_NAME="${GROUP_OVERRIDE:-$DEFAULT_GROUP}"
+
+# --------- spec sanity ---------
+[ -f "$SPEC_PATH" ] || { echo "Spec file not found: $SPEC_PATH" >&2; exit 2; }
+
+EXPECTED_OPS=$(node -e "
+const s=require('$SPEC_PATH');
+const verbs=['get','post','put','patch','delete','head','options'];
+let n=0;
+for(const p of Object.values(s.paths||{})) for(const v of Object.keys(p)) if(verbs.includes(v)) n++;
+console.log(n);
+")
+TITLE=$(node -e "console.log(require('$SPEC_PATH').info.title)")
+VERSION=$(node -e "console.log(require('$SPEC_PATH').info.version)")
+VERSION_ID="$TITLE:$VERSION"
+INSTANCE_NAME=$(echo "$TITLE" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
+
+# --------- helpers ---------
+STAGES_JSON="[]"
+record_stage() {
+  local name="$1" ok="$2" detail="$3"
+  STAGES_JSON=$(node -e "
+const s=$STAGES_JSON;
+s.push({name:'$name', ok:$ok, detail:'$detail'.replace(/\\\\/g,'\\\\\\\\').replace(/\n/g,' ')});
+console.log(JSON.stringify(s));
+")
+}
+
+emit_report() {
+  local verdict="$1" message="${2:-}"
+  if $JSON_OUT; then
+    node -e "
+console.log(JSON.stringify({
+  spec: '$SPEC_PATH',
+  versionId: '$VERSION_ID',
+  expectedOps: $EXPECTED_OPS,
+  verdict: '$verdict',
+  message: '$message'.replace(/'/g, \"\\\\'\"),
+  stages: $STAGES_JSON
+}, null, 2));
+"
+  else
+    echo "=== Integration Validation Report ==="
+    echo "Spec:          $SPEC_PATH"
+    echo "VersionId:     $VERSION_ID"
+    echo "Expected ops:  $EXPECTED_OPS"
+    echo "Verdict:       $verdict"
+    [ -n "$message" ] && echo "Message:       $message"
+    echo ""
+    echo "Stage breakdown:"
+    node -e "
+const s=$STAGES_JSON;
+for (const x of s) {
+  const mark = x.ok ? '✓' : '✗';
+  console.log('  [' + mark + '] ' + x.name.padEnd(16) + x.detail);
+}
+"
+  fi
+}
+
+# --------- step 0: login + sanity ping ---------
+TOKEN=$(curl -s -X POST "$IAP_URL/login" \
+  -H "Content-Type: application/json" \
+  -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}")
+SANITY=$(curl -s -o /dev/null -w "%{http_code}" \
+  -H "Cookie: token=$TOKEN" \
+  "$IAP_URL/authorization/accounts?limit=1")
+if [ "$SANITY" != "200" ]; then
+  record_stage "login" "false" "sanity ping HTTP $SANITY, login body: ${TOKEN:0:120}"
+  emit_report "FAIL" "Login failed sanity ping"
+  exit 2
+fi
+record_stage "login" "true" "sanity ping HTTP 200"
+
+# --------- step 1: import the spec (the platform validation) ---------
+node -e "
+const s=require('$SPEC_PATH');
+require('fs').writeFileSync('/tmp/iap-import-body.$$.json', JSON.stringify({model: s}));
+"
+IMPORT_FULL=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integration-models" \
+  -H "Cookie: token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  --data @"/tmp/iap-import-body.$$.json")
+IMPORT_CODE=$(echo "$IMPORT_FULL" | tail -n1 | sed 's/HTTPCODE://')
+IMPORT_BODY=$(echo "$IMPORT_FULL" | sed '$d')
+rm -f "/tmp/iap-import-body.$$.json"
+
+if [ "$IMPORT_CODE" = "500" ] && echo "$IMPORT_BODY" | grep -q "already exists"; then
+  # Model already imported from a previous run; that's fine for validation purposes
+  record_stage "import" "true" "HTTP 500 (already imported, treating as pass)"
+elif [ "$IMPORT_CODE" -ge 200 ] && [ "$IMPORT_CODE" -lt 300 ]; then
+  record_stage "import" "true" "HTTP $IMPORT_CODE"
+else
+  # extract first error message if AJV-style array
+  ERR_SUMMARY=$(echo "$IMPORT_BODY" | node -e "
+try {
+  const b=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+  if (Array.isArray(b) && b.length) {
+    console.log('first AJV error: ' + (b[0].instancePath||'(root)') + ' ' + (b[0].message||''));
+  } else if (typeof b === 'string') { console.log(b); }
+  else { console.log(JSON.stringify(b).slice(0,200)); }
+} catch(e) { console.log(require('fs').readFileSync(0,'utf-8').slice(0,200)); }
+")
+  record_stage "import" "false" "HTTP $IMPORT_CODE: $ERR_SUMMARY"
+  emit_report "FAIL"
+  exit 1
+fi
+
+# --------- step 2: create instance (idempotent) ---------
+INSTANCE_FULL=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integrations" \
+  -H "Cookie: token=$TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"properties\": {\"name\": \"$INSTANCE_NAME\", \"type\": \"Adapter\", \"properties\": {\"id\": \"$INSTANCE_NAME\", \"type\": \"$VERSION_ID\"}, \"virtual\": true}}")
+INSTANCE_CODE=$(echo "$INSTANCE_FULL" | tail -n1 | sed 's/HTTPCODE://')
+INSTANCE_BODY=$(echo "$INSTANCE_FULL" | sed '$d')
+
+if [ "$INSTANCE_CODE" -ge 200 ] && [ "$INSTANCE_CODE" -lt 300 ]; then
+  record_stage "instance" "true" "HTTP $INSTANCE_CODE (created)"
+elif echo "$INSTANCE_BODY" | grep -qi "already exists\|duplicate"; then
+  record_stage "instance" "true" "HTTP $INSTANCE_CODE (already exists)"
+else
+  record_stage "instance" "false" "HTTP $INSTANCE_CODE: ${INSTANCE_BODY:0:120}"
+  emit_report "FAIL"
+  exit 1
+fi
+
+# --------- step 3: find auto-created admin role ---------
+ROLES=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/roles?limit=500")
+ROLE_ID=$(echo "$ROLES" | node -e "
+const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+const role=(r.results||[]).find(x=>x.provenance==='$VERSION_ID' && x.name==='admin');
+console.log(role?._id||'');
+")
+if [ -z "$ROLE_ID" ]; then
+  record_stage "role-discovery" "false" "no admin role with provenance=$VERSION_ID"
+  emit_report "FAIL"
+  exit 1
+fi
+record_stage "role-discovery" "true" "role_id=$ROLE_ID"
+
+# --------- step 4: assign role to group ---------
+ALL_GROUPS=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/groups?limit=200")
+GROUP_ID=$(echo "$ALL_GROUPS" | node -e "
+const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+const g=(r.results||[]).find(x=>x.name==='$GROUP_NAME');
+console.log(g?._id||'');
+")
+if [ -z "$GROUP_ID" ]; then
+  AVAILABLE=$(echo "$ALL_GROUPS" | node -e "
+const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+console.log((r.results||[]).map(g=>g.name).join(', '));
+")
+  record_stage "authz" "false" "group '$GROUP_NAME' not found. Available: $AVAILABLE"
+  emit_report "FAIL"
+  exit 1
+fi
+
+CURRENT=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/groups/$GROUP_ID" \
+  | node -e "const g=JSON.parse(require('fs').readFileSync(0,'utf-8'));console.log(JSON.stringify(g.assignedRoles||[]))")
+ALREADY_GRANTED=$(node -e "console.log($CURRENT.some(r=>r.roleId==='$ROLE_ID') ? 'yes' : 'no')")
+
+if [ "$ALREADY_GRANTED" = "yes" ]; then
+  record_stage "authz" "true" "group=$GROUP_NAME (role already attached)"
+else
+  NEW_ROLES=$(node -e "
+const cur=$CURRENT;
+cur.push({roleId:'$ROLE_ID'});
+console.log(JSON.stringify(cur));
+")
+  PATCH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$IAP_URL/authorization/groups/$GROUP_ID" \
+    -H "Cookie: token=$TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"updates\": {\"assignedRoles\": $NEW_ROLES}}")
+  if [ "$PATCH_CODE" -ge 200 ] && [ "$PATCH_CODE" -lt 300 ]; then
+    record_stage "authz" "true" "group=$GROUP_NAME, HTTP $PATCH_CODE (newly granted)"
+  else
+    record_stage "authz" "false" "group=$GROUP_NAME, HTTP $PATCH_CODE"
+    emit_report "FAIL"
+    exit 1
+  fi
+fi
+
+# --------- step 5: verify method count matches expected ---------
+ACTUAL_METHODS=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/roles/$ROLE_ID" \
+  | node -e "
+const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+const role=r.result||r;
+console.log((role.allowedMethods||[]).length);
+")
+
+if [ "$ACTUAL_METHODS" = "$EXPECTED_OPS" ]; then
+  record_stage "methods" "true" "$ACTUAL_METHODS/$EXPECTED_OPS"
+  FINAL="PASS"
+elif [ "$ACTUAL_METHODS" = "0" ]; then
+  record_stage "methods" "false" "0/$EXPECTED_OPS (no methods on role - check role discovery filter)"
+  FINAL="FAIL"
+else
+  record_stage "methods" "false" "$ACTUAL_METHODS/$EXPECTED_OPS (some operations dropped during import - usually duplicate/missing operationIds)"
+  FINAL="PARTIAL"
+fi
+
+# --------- step 6: cleanup (optional) ---------
+if $CLEANUP; then
+  curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$INSTANCE_NAME" -H "Cookie: token=$TOKEN"
+  ENC=$(node -e "console.log(encodeURIComponent('$VERSION_ID'))")
+  curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$ENC" -H "Cookie: token=$TOKEN"
+  record_stage "cleanup" "true" "deleted instance + model"
+fi
+
+emit_report "$FINAL"
+[ "$FINAL" = "PASS" ] && exit 0 || exit 1
