@@ -2,43 +2,49 @@
 # validate-integration: end-to-end OpenAPI spec validation against an Itential dev stack.
 #
 # Usage:
-#   validate-integration <path-to-openapi-spec.json> [--cleanup] [--group <groupName>] [--json]
+#   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
+#   validate-integration fetch [<N> | --all] [--branch <name>]
+#   validate-integration bulk  [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
+#   validate-integration status [--json]
+#
+# Subcommands:
+#   (none)   Validate a single spec by path (current behavior). If the spec
+#            lives under the managed specs/ tree, it's moved into the matching
+#            bucket (validated/partial/failed) after the run, and you'll be
+#            prompted before re-running a spec that's already in validated/.
+#   fetch    Pull OpenAPI specs from the assets repo into specs/unvalidated/.
+#            Specs already present in any bucket are skipped.
+#   bulk     Validate every spec under specs/unvalidated/. Prompts once before
+#            including already-validated specs (override with --rerun/--no-rerun).
+#   status   Print a summary of specs per bucket.
 #
 # Exit codes:
-#   0 = PASS
-#   1 = validation FAIL or PARTIAL
+#   0 = PASS (single) or no failures (bulk/fetch/status)
+#   1 = at least one spec FAILed or was PARTIAL
 #   2 = setup error (bad args, missing config, login failed, dev stack unreachable)
 
 set -uo pipefail
 
 CONFIG_DIR="$HOME/.claude/skills/validate-integration"
 CONFIG_FILE="$CONFIG_DIR/config.json"
-
-# --------- arg parsing ---------
-SPEC_PATH=""
-GROUP_OVERRIDE=""
-CLEANUP=false
-JSON_OUT=false
+DEFAULT_PROJECT_ROOT="$CONFIG_DIR/specs"
+DEFAULT_ASSETS_CACHE="$HOME/.cache/itential-assets"
+DEFAULT_ASSETS_REPO_URL="https://github.com/itential/assets.git"
+DEFAULT_ASSETS_BRANCH="add-openapi-specs"
+BUCKETS=(unvalidated validated partial failed)
 
 usage() {
-  echo "Usage: validate-integration <spec.json> [--cleanup] [--group <name>] [--json]" >&2
+  cat >&2 <<'EOF'
+Usage:
+  validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
+  validate-integration fetch [<N> | --all] [--branch <name>]
+  validate-integration bulk  [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
+  validate-integration status [--json]
+EOF
   exit 2
 }
 
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --cleanup)  CLEANUP=true; shift ;;
-    --group)    GROUP_OVERRIDE="${2:-}"; shift 2 ;;
-    --json)     JSON_OUT=true; shift ;;
-    -h|--help)  usage ;;
-    -*)         echo "Unknown flag: $1" >&2; usage ;;
-    *)          if [ -z "$SPEC_PATH" ]; then SPEC_PATH="$1"; else usage; fi; shift ;;
-  esac
-done
-
-[ -n "$SPEC_PATH" ] || usage
-
-# --------- config ---------
+# --------- bootstrap config ---------
 if [ ! -f "$CONFIG_FILE" ]; then
   mkdir -p "$CONFIG_DIR"
   cat > "$CONFIG_FILE" <<EOF
@@ -47,122 +53,146 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "username": "admin@itential",
   "password": "admin",
   "default_group": "admin_group",
-  "download_path": "$HOME/Downloads"
+  "download_path": "$HOME/Downloads",
+  "project_root": "$DEFAULT_PROJECT_ROOT",
+  "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
+  "assets_branch": "$DEFAULT_ASSETS_BRANCH",
+  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
   echo "Created default config at $CONFIG_FILE" >&2
 fi
 
-IAP_URL=$(node -e "console.log(require('$CONFIG_FILE').iap_url)")
-USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username)")
-PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password)")
-DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group)")
+IAP_URL=$(node -e "console.log(require('$CONFIG_FILE').iap_url || '')")
+USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username || '')")
+PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password || '')")
+DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group || '')")
 DOWNLOAD_PATH=$(node -e "const c=require('$CONFIG_FILE'); console.log((c.download_path||'').replace(/^~/, process.env.HOME))")
-GROUP_NAME="${GROUP_OVERRIDE:-$DEFAULT_GROUP}"
+PROJECT_ROOT=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.project_root||'$DEFAULT_PROJECT_ROOT')).replace(/^~/, process.env.HOME))")
+ASSETS_REPO_URL=$(node -e "console.log(require('$CONFIG_FILE').assets_repo_url || '$DEFAULT_ASSETS_REPO_URL')")
+ASSETS_BRANCH=$(node -e "console.log(require('$CONFIG_FILE').assets_branch || '$DEFAULT_ASSETS_BRANCH')")
+ASSETS_CACHE_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_cache_dir||'$DEFAULT_ASSETS_CACHE')).replace(/^~/, process.env.HOME))")
 
-# --------- spec resolution ---------
-# If the path-as-given doesn't exist, try $DOWNLOAD_PATH/$SPEC_PATH so users can
-# pass bare filenames like `validate-integration example.json`.
-if [ ! -f "$SPEC_PATH" ] && [ -n "$DOWNLOAD_PATH" ] && [ -f "$DOWNLOAD_PATH/$SPEC_PATH" ]; then
-  SPEC_PATH="$DOWNLOAD_PATH/$SPEC_PATH"
-fi
-if [ ! -f "$SPEC_PATH" ]; then
-  echo "Spec file not found: $SPEC_PATH" >&2
-  [ -n "$DOWNLOAD_PATH" ] && echo "  also tried: $DOWNLOAD_PATH/$SPEC_PATH" >&2
-  exit 2
-fi
+ensure_project_dirs() {
+  for b in "${BUCKETS[@]}"; do
+    mkdir -p "$PROJECT_ROOT/$b"
+  done
+}
 
-EXPECTED_OPS=$(node -e "
-const s=require('$SPEC_PATH');
+# Convert an absolute path under $PROJECT_ROOT/<bucket>/ to its bucket-relative
+# canonical form (e.g., Atlassian/Bitbucket/bitbucket_cloud_2.0.json). Echoes
+# nothing if the path isn't under the project root.
+canonical_relpath() {
+  local abs="$1"
+  for b in "${BUCKETS[@]}"; do
+    local prefix="$PROJECT_ROOT/$b/"
+    if [[ "$abs" == "$prefix"* ]]; then
+      echo "${abs#$prefix}"
+      return
+    fi
+  done
+  echo ""
+}
+
+# Find which bucket (if any) currently holds a given canonical relpath.
+find_bucket_for() {
+  local rel="$1"
+  for b in "${BUCKETS[@]}"; do
+    if [ -f "$PROJECT_ROOT/$b/$rel" ]; then
+      echo "$b"
+      return
+    fi
+  done
+  echo ""
+}
+
+# Move a spec file into a target bucket, preserving its relative subpath.
+# Removes empty parent dirs from the old location.
+move_to_bucket() {
+  local src="$1" target_bucket="$2"
+  local rel
+  rel=$(canonical_relpath "$src")
+  [ -z "$rel" ] && return 1
+  local dest="$PROJECT_ROOT/$target_bucket/$rel"
+  mkdir -p "$(dirname "$dest")"
+  if [ "$src" != "$dest" ]; then
+    mv -f "$src" "$dest"
+    # Prune empty source dirs (best-effort)
+    local d
+    d=$(dirname "$src")
+    while [ "$d" != "$PROJECT_ROOT" ] && [ "$d" != "/" ] && [ -d "$d" ] && [ -z "$(ls -A "$d" 2>/dev/null)" ]; do
+      rmdir "$d" 2>/dev/null || break
+      d=$(dirname "$d")
+    done
+  fi
+  echo "$dest"
+}
+
+# --------- per-spec pipeline ---------
+# Inputs: $1 = absolute spec path, $2 = token
+# Optional env: GROUP_NAME, CLEANUP, JSON_OUT, QUIET (=true to suppress full report)
+# Sets globals: SPEC_VERDICT, SPEC_VERSION_ID, SPEC_EXPECTED_OPS, SPEC_ACTUAL_METHODS,
+#               SPEC_STAGES_JSON, SPEC_FAIL_STAGE, SPEC_FAIL_DETAIL
+validate_one_spec() {
+  local spec_path="$1" token="$2"
+  SPEC_VERDICT=""
+  SPEC_FAIL_STAGE=""
+  SPEC_FAIL_DETAIL=""
+  SPEC_ACTUAL_METHODS=""
+  local stages_json="[]"
+
+  local record_local
+  record_local() {
+    local name="$1" ok="$2" detail="$3"
+    stages_json=$(node -e "
+const s=$stages_json;
+s.push({name:'$name', ok:$ok, detail:process.argv[1]});
+console.log(JSON.stringify(s));
+" -- "$detail")
+  }
+
+  # Parse spec metadata
+  local title version
+  if ! title=$(node -e "console.log(require('$spec_path').info.title)" 2>/dev/null); then
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="parse"
+    SPEC_FAIL_DETAIL="could not parse spec JSON"
+    SPEC_STAGES_JSON='[{"name":"parse","ok":false,"detail":"could not parse spec JSON"}]'
+    return 1
+  fi
+  version=$(node -e "console.log(require('$spec_path').info.version)")
+  SPEC_VERSION_ID="$title:$version"
+  SPEC_EXPECTED_OPS=$(node -e "
+const s=require('$spec_path');
 const verbs=['get','post','put','patch','delete','head','options'];
 let n=0;
 for(const p of Object.values(s.paths||{})) for(const v of Object.keys(p)) if(verbs.includes(v)) n++;
 console.log(n);
 ")
-TITLE=$(node -e "console.log(require('$SPEC_PATH').info.title)")
-VERSION=$(node -e "console.log(require('$SPEC_PATH').info.version)")
-VERSION_ID="$TITLE:$VERSION"
-INSTANCE_NAME=$(echo "$TITLE" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
+  local instance_name
+  instance_name=$(echo "$title" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
 
-# --------- helpers ---------
-STAGES_JSON="[]"
-record_stage() {
-  local name="$1" ok="$2" detail="$3"
-  STAGES_JSON=$(node -e "
-const s=$STAGES_JSON;
-s.push({name:'$name', ok:$ok, detail:'$detail'.replace(/\\\\/g,'\\\\\\\\').replace(/\n/g,' ')});
-console.log(JSON.stringify(s));
-")
-}
+  # Step 1: import
+  local tmp_body
+  tmp_body=$(mktemp -t iap-import-body.XXXXXX)
+  node -e "require('fs').writeFileSync('$tmp_body', JSON.stringify({model: require('$spec_path')}))"
+  local import_full import_code import_body
+  import_full=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integration-models" \
+    -H "Cookie: token=$token" \
+    -H "Content-Type: application/json" \
+    --data @"$tmp_body")
+  import_code=$(echo "$import_full" | tail -n1 | sed 's/HTTPCODE://')
+  import_body=$(echo "$import_full" | sed '$d')
+  rm -f "$tmp_body"
 
-emit_report() {
-  local verdict="$1" message="${2:-}"
-  if $JSON_OUT; then
-    node -e "
-console.log(JSON.stringify({
-  spec: '$SPEC_PATH',
-  versionId: '$VERSION_ID',
-  expectedOps: $EXPECTED_OPS,
-  verdict: '$verdict',
-  message: '$message'.replace(/'/g, \"\\\\'\"),
-  stages: $STAGES_JSON
-}, null, 2));
-"
+  if [ "$import_code" = "500" ] && echo "$import_body" | grep -q "already exists"; then
+    record_local "import" "true" "HTTP 500 (already imported, treating as pass)"
+  elif [ "$import_code" -ge 200 ] && [ "$import_code" -lt 300 ]; then
+    record_local "import" "true" "HTTP $import_code"
   else
-    echo "=== Integration Validation Report ==="
-    echo "Spec:          $SPEC_PATH"
-    echo "VersionId:     $VERSION_ID"
-    echo "Expected ops:  $EXPECTED_OPS"
-    echo "Verdict:       $verdict"
-    [ -n "$message" ] && echo "Message:       $message"
-    echo ""
-    echo "Stage breakdown:"
-    node -e "
-const s=$STAGES_JSON;
-for (const x of s) {
-  const mark = x.ok ? '✓' : '✗';
-  console.log('  [' + mark + '] ' + x.name.padEnd(16) + x.detail);
-}
-"
-  fi
-}
-
-# --------- step 0: login + sanity ping ---------
-TOKEN=$(curl -s -X POST "$IAP_URL/login" \
-  -H "Content-Type: application/json" \
-  -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}")
-SANITY=$(curl -s -o /dev/null -w "%{http_code}" \
-  -H "Cookie: token=$TOKEN" \
-  "$IAP_URL/authorization/accounts?limit=1")
-if [ "$SANITY" != "200" ]; then
-  record_stage "login" "false" "sanity ping HTTP $SANITY, login body: ${TOKEN:0:120}"
-  emit_report "FAIL" "Login failed sanity ping"
-  exit 2
-fi
-record_stage "login" "true" "sanity ping HTTP 200"
-
-# --------- step 1: import the spec (the platform validation) ---------
-node -e "
-const s=require('$SPEC_PATH');
-require('fs').writeFileSync('/tmp/iap-import-body.$$.json', JSON.stringify({model: s}));
-"
-IMPORT_FULL=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integration-models" \
-  -H "Cookie: token=$TOKEN" \
-  -H "Content-Type: application/json" \
-  --data @"/tmp/iap-import-body.$$.json")
-IMPORT_CODE=$(echo "$IMPORT_FULL" | tail -n1 | sed 's/HTTPCODE://')
-IMPORT_BODY=$(echo "$IMPORT_FULL" | sed '$d')
-rm -f "/tmp/iap-import-body.$$.json"
-
-if [ "$IMPORT_CODE" = "500" ] && echo "$IMPORT_BODY" | grep -q "already exists"; then
-  # Model already imported from a previous run; that's fine for validation purposes
-  record_stage "import" "true" "HTTP 500 (already imported, treating as pass)"
-elif [ "$IMPORT_CODE" -ge 200 ] && [ "$IMPORT_CODE" -lt 300 ]; then
-  record_stage "import" "true" "HTTP $IMPORT_CODE"
-else
-  # extract first error message if AJV-style array
-  ERR_SUMMARY=$(echo "$IMPORT_BODY" | node -e "
+    local err_summary
+    err_summary=$(echo "$import_body" | node -e "
 try {
   const b=JSON.parse(require('fs').readFileSync(0,'utf-8'));
   if (Array.isArray(b) && b.length) {
@@ -171,111 +201,615 @@ try {
   else { console.log(JSON.stringify(b).slice(0,200)); }
 } catch(e) { console.log(require('fs').readFileSync(0,'utf-8').slice(0,200)); }
 ")
-  record_stage "import" "false" "HTTP $IMPORT_CODE: $ERR_SUMMARY"
-  emit_report "FAIL"
-  exit 1
-fi
+    record_local "import" "false" "HTTP $import_code: $err_summary"
+    SPEC_STAGES_JSON="$stages_json"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="import"
+    SPEC_FAIL_DETAIL="HTTP $import_code: $err_summary"
+    return 1
+  fi
 
-# --------- step 2: create instance (idempotent) ---------
-INSTANCE_FULL=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integrations" \
-  -H "Cookie: token=$TOKEN" \
-  -H "Content-Type: application/json" \
-  -d "{\"properties\": {\"name\": \"$INSTANCE_NAME\", \"type\": \"Adapter\", \"properties\": {\"id\": \"$INSTANCE_NAME\", \"type\": \"$VERSION_ID\"}, \"virtual\": true}}")
-INSTANCE_CODE=$(echo "$INSTANCE_FULL" | tail -n1 | sed 's/HTTPCODE://')
-INSTANCE_BODY=$(echo "$INSTANCE_FULL" | sed '$d')
+  # Step 2: instance
+  local instance_full instance_code instance_body
+  instance_full=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integrations" \
+    -H "Cookie: token=$token" \
+    -H "Content-Type: application/json" \
+    -d "{\"properties\": {\"name\": \"$instance_name\", \"type\": \"Adapter\", \"properties\": {\"id\": \"$instance_name\", \"type\": \"$SPEC_VERSION_ID\"}, \"virtual\": true}}")
+  instance_code=$(echo "$instance_full" | tail -n1 | sed 's/HTTPCODE://')
+  instance_body=$(echo "$instance_full" | sed '$d')
 
-if [ "$INSTANCE_CODE" -ge 200 ] && [ "$INSTANCE_CODE" -lt 300 ]; then
-  record_stage "instance" "true" "HTTP $INSTANCE_CODE (created)"
-elif echo "$INSTANCE_BODY" | grep -qi "already exists\|duplicate"; then
-  record_stage "instance" "true" "HTTP $INSTANCE_CODE (already exists)"
-else
-  record_stage "instance" "false" "HTTP $INSTANCE_CODE: ${INSTANCE_BODY:0:120}"
-  emit_report "FAIL"
-  exit 1
-fi
+  if [ "$instance_code" -ge 200 ] && [ "$instance_code" -lt 300 ]; then
+    record_local "instance" "true" "HTTP $instance_code (created)"
+  elif echo "$instance_body" | grep -qi "already exists\|duplicate"; then
+    record_local "instance" "true" "HTTP $instance_code (already exists)"
+  else
+    record_local "instance" "false" "HTTP $instance_code: ${instance_body:0:120}"
+    SPEC_STAGES_JSON="$stages_json"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="instance"
+    SPEC_FAIL_DETAIL="HTTP $instance_code: ${instance_body:0:120}"
+    return 1
+  fi
 
-# --------- step 3: find auto-created admin role ---------
-ROLES=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/roles?limit=500")
-ROLE_ID=$(echo "$ROLES" | node -e "
+  # Step 3: role discovery
+  local roles role_id
+  roles=$(curl -s -H "Cookie: token=$token" "$IAP_URL/authorization/roles?limit=500")
+  role_id=$(echo "$roles" | node -e "
 const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
-const role=(r.results||[]).find(x=>x.provenance==='$VERSION_ID' && x.name==='admin');
+const role=(r.results||[]).find(x=>x.provenance===process.argv[1] && x.name==='admin');
 console.log(role?._id||'');
-")
-if [ -z "$ROLE_ID" ]; then
-  record_stage "role-discovery" "false" "no admin role with provenance=$VERSION_ID"
-  emit_report "FAIL"
-  exit 1
-fi
-record_stage "role-discovery" "true" "role_id=$ROLE_ID"
+" -- "$SPEC_VERSION_ID")
+  if [ -z "$role_id" ]; then
+    record_local "role-discovery" "false" "no admin role with provenance=$SPEC_VERSION_ID"
+    SPEC_STAGES_JSON="$stages_json"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="role-discovery"
+    SPEC_FAIL_DETAIL="no admin role with provenance=$SPEC_VERSION_ID"
+    return 1
+  fi
+  record_local "role-discovery" "true" "role_id=$role_id"
 
-# --------- step 4: assign role to group ---------
-ALL_GROUPS=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/groups?limit=200")
-GROUP_ID=$(echo "$ALL_GROUPS" | node -e "
+  # Step 4: authz
+  local all_groups group_id
+  all_groups=$(curl -s -H "Cookie: token=$token" "$IAP_URL/authorization/groups?limit=200")
+  group_id=$(echo "$all_groups" | node -e "
 const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
-const g=(r.results||[]).find(x=>x.name==='$GROUP_NAME');
+const g=(r.results||[]).find(x=>x.name===process.argv[1]);
 console.log(g?._id||'');
-")
-if [ -z "$GROUP_ID" ]; then
-  AVAILABLE=$(echo "$ALL_GROUPS" | node -e "
+" -- "$GROUP_NAME")
+  if [ -z "$group_id" ]; then
+    local available
+    available=$(echo "$all_groups" | node -e "
 const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
 console.log((r.results||[]).map(g=>g.name).join(', '));
 ")
-  record_stage "authz" "false" "group '$GROUP_NAME' not found. Available: $AVAILABLE"
-  emit_report "FAIL"
-  exit 1
-fi
+    record_local "authz" "false" "group '$GROUP_NAME' not found. Available: $available"
+    SPEC_STAGES_JSON="$stages_json"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="authz"
+    SPEC_FAIL_DETAIL="group '$GROUP_NAME' not found"
+    return 1
+  fi
 
-CURRENT=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/groups/$GROUP_ID" \
-  | node -e "const g=JSON.parse(require('fs').readFileSync(0,'utf-8'));console.log(JSON.stringify(g.assignedRoles||[]))")
-ALREADY_GRANTED=$(node -e "console.log($CURRENT.some(r=>r.roleId==='$ROLE_ID') ? 'yes' : 'no')")
+  local current already
+  current=$(curl -s -H "Cookie: token=$token" "$IAP_URL/authorization/groups/$group_id" \
+    | node -e "const g=JSON.parse(require('fs').readFileSync(0,'utf-8'));console.log(JSON.stringify(g.assignedRoles||[]))")
+  already=$(node -e "console.log($current.some(r=>r.roleId==='$role_id') ? 'yes' : 'no')")
 
-if [ "$ALREADY_GRANTED" = "yes" ]; then
-  record_stage "authz" "true" "group=$GROUP_NAME (role already attached)"
-else
-  NEW_ROLES=$(node -e "
-const cur=$CURRENT;
-cur.push({roleId:'$ROLE_ID'});
+  if [ "$already" = "yes" ]; then
+    record_local "authz" "true" "group=$GROUP_NAME (role already attached)"
+  else
+    local new_roles patch_code
+    new_roles=$(node -e "
+const cur=$current;
+cur.push({roleId:'$role_id'});
 console.log(JSON.stringify(cur));
 ")
-  PATCH_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$IAP_URL/authorization/groups/$GROUP_ID" \
-    -H "Cookie: token=$TOKEN" \
-    -H "Content-Type: application/json" \
-    -d "{\"updates\": {\"assignedRoles\": $NEW_ROLES}}")
-  if [ "$PATCH_CODE" -ge 200 ] && [ "$PATCH_CODE" -lt 300 ]; then
-    record_stage "authz" "true" "group=$GROUP_NAME, HTTP $PATCH_CODE (newly granted)"
-  else
-    record_stage "authz" "false" "group=$GROUP_NAME, HTTP $PATCH_CODE"
-    emit_report "FAIL"
-    exit 1
+    patch_code=$(curl -s -o /dev/null -w "%{http_code}" -X PATCH "$IAP_URL/authorization/groups/$group_id" \
+      -H "Cookie: token=$token" \
+      -H "Content-Type: application/json" \
+      -d "{\"updates\": {\"assignedRoles\": $new_roles}}")
+    if [ "$patch_code" -ge 200 ] && [ "$patch_code" -lt 300 ]; then
+      record_local "authz" "true" "group=$GROUP_NAME, HTTP $patch_code (newly granted)"
+    else
+      record_local "authz" "false" "group=$GROUP_NAME, HTTP $patch_code"
+      SPEC_STAGES_JSON="$stages_json"
+      SPEC_VERDICT="FAIL"
+      SPEC_FAIL_STAGE="authz"
+      SPEC_FAIL_DETAIL="group=$GROUP_NAME, HTTP $patch_code"
+      return 1
+    fi
   fi
-fi
 
-# --------- step 5: verify method count matches expected ---------
-ACTUAL_METHODS=$(curl -s -H "Cookie: token=$TOKEN" "$IAP_URL/authorization/roles/$ROLE_ID" \
-  | node -e "
+  # Step 5: methods
+  SPEC_ACTUAL_METHODS=$(curl -s -H "Cookie: token=$token" "$IAP_URL/authorization/roles/$role_id" \
+    | node -e "
 const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
 const role=r.result||r;
 console.log((role.allowedMethods||[]).length);
 ")
+  if [ "$SPEC_ACTUAL_METHODS" = "$SPEC_EXPECTED_OPS" ]; then
+    record_local "methods" "true" "$SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS"
+    SPEC_VERDICT="PASS"
+  elif [ "$SPEC_ACTUAL_METHODS" = "0" ]; then
+    record_local "methods" "false" "0/$SPEC_EXPECTED_OPS (no methods on role - check role discovery filter)"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="methods"
+    SPEC_FAIL_DETAIL="0/$SPEC_EXPECTED_OPS"
+  else
+    record_local "methods" "false" "$SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS (some operations dropped during import - usually duplicate/missing operationIds)"
+    SPEC_VERDICT="PARTIAL"
+    SPEC_FAIL_STAGE="methods"
+    SPEC_FAIL_DETAIL="$SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS"
+  fi
 
-if [ "$ACTUAL_METHODS" = "$EXPECTED_OPS" ]; then
-  record_stage "methods" "true" "$ACTUAL_METHODS/$EXPECTED_OPS"
-  FINAL="PASS"
-elif [ "$ACTUAL_METHODS" = "0" ]; then
-  record_stage "methods" "false" "0/$EXPECTED_OPS (no methods on role - check role discovery filter)"
-  FINAL="FAIL"
-else
-  record_stage "methods" "false" "$ACTUAL_METHODS/$EXPECTED_OPS (some operations dropped during import - usually duplicate/missing operationIds)"
-  FINAL="PARTIAL"
-fi
+  # Step 6: optional cleanup
+  if [ "${CLEANUP:-false}" = "true" ]; then
+    curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$instance_name" -H "Cookie: token=$token"
+    local enc
+    enc=$(node -e "console.log(encodeURIComponent('$SPEC_VERSION_ID'))")
+    curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$token"
+    record_local "cleanup" "true" "deleted instance + model"
+  fi
 
-# --------- step 6: cleanup (optional) ---------
-if $CLEANUP; then
-  curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$INSTANCE_NAME" -H "Cookie: token=$TOKEN"
-  ENC=$(node -e "console.log(encodeURIComponent('$VERSION_ID'))")
-  curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$ENC" -H "Cookie: token=$TOKEN"
-  record_stage "cleanup" "true" "deleted instance + model"
-fi
+  SPEC_STAGES_JSON="$stages_json"
+  return 0
+}
 
-emit_report "$FINAL"
-[ "$FINAL" = "PASS" ] && exit 0 || exit 1
+# --------- report helpers ---------
+emit_full_report() {
+  # Args: spec_path, login_stage_json
+  local spec_path="$1" login_json="$2"
+  local stages
+  stages=$(node -e "
+const login=JSON.parse(process.argv[1]);
+const rest=JSON.parse(process.argv[2]);
+console.log(JSON.stringify([login, ...rest]));
+" -- "$login_json" "$SPEC_STAGES_JSON")
+  if [ "${JSON_OUT:-false}" = "true" ]; then
+    node -e "
+console.log(JSON.stringify({
+  spec: process.argv[1],
+  versionId: process.argv[2],
+  expectedOps: parseInt(process.argv[3], 10),
+  actualMethods: process.argv[4] ? parseInt(process.argv[4], 10) : null,
+  verdict: process.argv[5],
+  stages: JSON.parse(process.argv[6])
+}, null, 2));
+" -- "$spec_path" "$SPEC_VERSION_ID" "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "$SPEC_VERDICT" "$stages"
+  else
+    echo "=== Integration Validation Report ==="
+    echo "Spec:          $spec_path"
+    echo "VersionId:     $SPEC_VERSION_ID"
+    echo "Expected ops:  $SPEC_EXPECTED_OPS"
+    echo "Verdict:       $SPEC_VERDICT"
+    echo ""
+    echo "Stage breakdown:"
+    node -e "
+const s=JSON.parse(process.argv[1]);
+for (const x of s) {
+  const mark = x.ok ? '✓' : '✗';
+  console.log('  [' + mark + '] ' + x.name.padEnd(16) + x.detail);
+}
+" -- "$stages"
+  fi
+}
+
+# Returns the verdict mark (✓/~/✗) for a one-line bulk row
+verdict_mark() {
+  case "$1" in
+    PASS)    echo "✓" ;;
+    PARTIAL) echo "~" ;;
+    *)       echo "✗" ;;
+  esac
+}
+
+# --------- login (shared by all run modes) ---------
+do_login() {
+  local token sanity
+  token=$(curl -s -X POST "$IAP_URL/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}")
+  sanity=$(curl -s -o /dev/null -w "%{http_code}" \
+    -H "Cookie: token=$token" \
+    "$IAP_URL/authorization/accounts?limit=1")
+  if [ "$sanity" != "200" ]; then
+    LOGIN_TOKEN=""
+    LOGIN_STAGE_JSON=$(node -e "console.log(JSON.stringify({name:'login', ok:false, detail:'sanity ping HTTP $sanity, login body: '+process.argv[1].slice(0,120)}))" -- "$token")
+    return 1
+  fi
+  LOGIN_TOKEN="$token"
+  LOGIN_STAGE_JSON='{"name":"login","ok":true,"detail":"sanity ping HTTP 200"}'
+  return 0
+}
+
+# --------- subcommands ---------
+
+cmd_single() {
+  # Parse single-spec args
+  local spec_path="" group_override="" cleanup=false json_out=false force_rerun=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --cleanup) cleanup=true; shift ;;
+      --group)   group_override="${2:-}"; shift 2 ;;
+      --json)    json_out=true; shift ;;
+      --force)   force_rerun=true; shift ;;
+      -h|--help) usage ;;
+      -*)        echo "Unknown flag: $1" >&2; usage ;;
+      *)         if [ -z "$spec_path" ]; then spec_path="$1"; else usage; fi; shift ;;
+    esac
+  done
+  [ -n "$spec_path" ] || usage
+
+  # Resolve relative + Downloads-shorthand paths
+  if [ ! -f "$spec_path" ] && [ -n "$DOWNLOAD_PATH" ] && [ -f "$DOWNLOAD_PATH/$spec_path" ]; then
+    spec_path="$DOWNLOAD_PATH/$spec_path"
+  fi
+  if [ ! -f "$spec_path" ]; then
+    echo "Spec file not found: $spec_path" >&2
+    [ -n "$DOWNLOAD_PATH" ] && echo "  also tried: $DOWNLOAD_PATH/$spec_path" >&2
+    exit 2
+  fi
+  # absolute path
+  spec_path=$(cd "$(dirname "$spec_path")" && pwd)/$(basename "$spec_path")
+
+  GROUP_NAME="${group_override:-$DEFAULT_GROUP}"
+  CLEANUP="$cleanup"
+  JSON_OUT="$json_out"
+
+  # Rerun prompt if spec is in the validated/partial buckets
+  ensure_project_dirs
+  local rel current_bucket
+  rel=$(canonical_relpath "$spec_path")
+  if [ -n "$rel" ]; then
+    current_bucket=$(find_bucket_for "$rel")
+    if { [ "$current_bucket" = "validated" ] || [ "$current_bucket" = "partial" ]; } && [ "$force_rerun" = "false" ]; then
+      if [ -t 0 ]; then
+        echo "This spec is already in '$current_bucket/'. Re-run? [y/N] " >&2
+        read -r yn
+        case "$yn" in [yY]|[yY][eE][sS]) ;; *) echo "Skipped." >&2; exit 0 ;; esac
+      else
+        echo "Spec already in '$current_bucket/'. Pass --force to re-run noninteractively." >&2
+        exit 0
+      fi
+    fi
+  fi
+
+  if ! do_login; then
+    if $JSON_OUT; then
+      node -e "
+console.log(JSON.stringify({
+  spec: process.argv[1],
+  verdict: 'FAIL',
+  stages: [JSON.parse(process.argv[2])]
+}, null, 2));
+" -- "$spec_path" "$LOGIN_STAGE_JSON"
+    else
+      echo "=== Integration Validation Report ==="
+      echo "Spec:          $spec_path"
+      echo "Verdict:       FAIL"
+      echo ""
+      echo "Stage breakdown:"
+      node -e "const x=JSON.parse(process.argv[1]); console.log('  [✗] login           '+x.detail);" -- "$LOGIN_STAGE_JSON"
+    fi
+    exit 2
+  fi
+
+  validate_one_spec "$spec_path" "$LOGIN_TOKEN"
+  emit_full_report "$spec_path" "$LOGIN_STAGE_JSON"
+
+  # Sort into bucket if spec lives under project root
+  if [ -n "$rel" ]; then
+    local target
+    case "$SPEC_VERDICT" in
+      PASS)    target="validated" ;;
+      PARTIAL) target="partial" ;;
+      *)       target="failed" ;;
+    esac
+    if [ "$current_bucket" != "$target" ]; then
+      local new_path
+      new_path=$(move_to_bucket "$spec_path" "$target")
+      $JSON_OUT || echo "Moved to: $new_path"
+    fi
+  fi
+
+  [ "$SPEC_VERDICT" = "PASS" ] && exit 0 || exit 1
+}
+
+cmd_fetch() {
+  local count="" fetch_all=false branch_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --all)    fetch_all=true; shift ;;
+      --branch) branch_override="${2:-}"; shift 2 ;;
+      -h|--help) usage ;;
+      -*)       echo "Unknown flag: $1" >&2; usage ;;
+      *)        if [ -z "$count" ]; then count="$1"; else usage; fi; shift ;;
+    esac
+  done
+  if ! $fetch_all && [ -z "$count" ]; then
+    echo "fetch: must specify a count (e.g., 'fetch 5') or --all" >&2
+    exit 2
+  fi
+  if ! $fetch_all; then
+    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+      echo "fetch: count must be a non-negative integer, got: $count" >&2
+      exit 2
+    fi
+  fi
+  local branch="${branch_override:-$ASSETS_BRANCH}"
+
+  ensure_project_dirs
+  mkdir -p "$(dirname "$ASSETS_CACHE_DIR")"
+
+  # Clone or update the cache
+  if [ -d "$ASSETS_CACHE_DIR/.git" ]; then
+    echo "Updating asset cache at $ASSETS_CACHE_DIR (branch $branch)..." >&2
+    git -C "$ASSETS_CACHE_DIR" fetch --depth 1 origin "$branch" >/dev/null 2>&1 || {
+      echo "git fetch failed; check network or repo access" >&2; exit 2;
+    }
+    git -C "$ASSETS_CACHE_DIR" checkout -B "$branch" "origin/$branch" >/dev/null 2>&1 || {
+      echo "git checkout $branch failed" >&2; exit 2;
+    }
+  else
+    echo "Cloning $ASSETS_REPO_URL (branch $branch) to $ASSETS_CACHE_DIR..." >&2
+    git clone --depth 1 --branch "$branch" "$ASSETS_REPO_URL" "$ASSETS_CACHE_DIR" >/dev/null 2>&1 || {
+      echo "git clone failed; check network or repo access" >&2; exit 2;
+    }
+  fi
+
+  # Discover specs in the cache (convention: */OpenAPIs/*.json)
+  local search_root
+  if [ -d "$ASSETS_CACHE_DIR/assets" ]; then
+    search_root="$ASSETS_CACHE_DIR/assets"
+  else
+    search_root="$ASSETS_CACHE_DIR"
+  fi
+
+  # Build candidate list: each line is "<canonical-rel-path>\t<abs-source-path>"
+  local candidates
+  candidates=$(find "$search_root" -type f -name '*.json' -path '*/OpenAPIs/*' 2>/dev/null | while read -r abs; do
+    local rel="${abs#$search_root/}"
+    # Strip the OpenAPIs/ middle dir: Vendor/Product/OpenAPIs/foo.json -> Vendor/Product/foo.json
+    local canonical
+    canonical=$(echo "$rel" | sed 's|/OpenAPIs/|/|')
+    printf '%s\t%s\n' "$canonical" "$abs"
+  done | sort)
+
+  if [ -z "$candidates" ]; then
+    echo "No specs found under $search_root/*/OpenAPIs/" >&2
+    exit 2
+  fi
+
+  # Filter out specs already present in any bucket
+  local pending=""
+  while IFS=$'\t' read -r canonical abs; do
+    [ -z "$canonical" ] && continue
+    if [ -z "$(find_bucket_for "$canonical")" ]; then
+      pending+="$canonical"$'\t'"$abs"$'\n'
+    fi
+  done <<< "$candidates"
+
+  local total_candidates available_count
+  total_candidates=$(echo "$candidates" | grep -c $'\t' || true)
+  available_count=$(printf '%s' "$pending" | grep -c $'\t' || true)
+
+  if [ "$available_count" -eq 0 ]; then
+    echo "Up to date: all $total_candidates specs in the repo are already in your project folder." >&2
+    exit 0
+  fi
+
+  # Take N (or all)
+  local take_n
+  if $fetch_all; then
+    take_n="$available_count"
+  else
+    take_n="$count"
+    if [ "$take_n" -gt "$available_count" ]; then take_n="$available_count"; fi
+  fi
+
+  local copied=0
+  while IFS=$'\t' read -r canonical abs; do
+    [ -z "$canonical" ] && continue
+    [ "$copied" -ge "$take_n" ] && break
+    local dest="$PROJECT_ROOT/unvalidated/$canonical"
+    mkdir -p "$(dirname "$dest")"
+    cp "$abs" "$dest"
+    copied=$((copied + 1))
+    echo "  + $canonical"
+  done <<< "$pending"
+
+  echo ""
+  echo "Fetched $copied spec(s) into $PROJECT_ROOT/unvalidated/."
+  local skipped=$((available_count - copied))
+  if [ "$skipped" -gt 0 ]; then
+    echo "$skipped additional unvalidated spec(s) available in the repo; run 'fetch --all' to grab everything."
+  fi
+}
+
+cmd_bulk() {
+  local rerun_mode="prompt" cleanup=false json_out=false group_override=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rerun)    rerun_mode="yes"; shift ;;
+      --no-rerun) rerun_mode="no"; shift ;;
+      --cleanup)  cleanup=true; shift ;;
+      --group)    group_override="${2:-}"; shift 2 ;;
+      --json)     json_out=true; shift ;;
+      -h|--help)  usage ;;
+      *)          echo "Unknown bulk arg: $1" >&2; usage ;;
+    esac
+  done
+  GROUP_NAME="${group_override:-$DEFAULT_GROUP}"
+  CLEANUP="$cleanup"
+  JSON_OUT="$json_out"
+
+  ensure_project_dirs
+
+  # Collect candidate spec paths
+  local unvalidated_list validated_list partial_list failed_list
+  unvalidated_list=$(find "$PROJECT_ROOT/unvalidated" -type f -name '*.json' 2>/dev/null | sort)
+  validated_list=$(find "$PROJECT_ROOT/validated" -type f -name '*.json' 2>/dev/null | sort)
+  partial_list=$(find "$PROJECT_ROOT/partial" -type f -name '*.json' 2>/dev/null | sort)
+  failed_list=$(find "$PROJECT_ROOT/failed" -type f -name '*.json' 2>/dev/null | sort)
+
+  local n_unvalidated n_validated
+  n_unvalidated=$(printf '%s' "$unvalidated_list" | grep -c . || true)
+  n_validated=$(printf '%s' "$validated_list" | grep -c . || true)
+
+  if [ "$n_unvalidated" -eq 0 ] && [ "$n_validated" -eq 0 ]; then
+    echo "No specs in $PROJECT_ROOT. Run 'validate-integration fetch <N>' first." >&2
+    exit 0
+  fi
+
+  # Decide whether to include validated/ specs in this run
+  local include_validated=false
+  if [ "$n_validated" -gt 0 ]; then
+    case "$rerun_mode" in
+      yes) include_validated=true ;;
+      no)  include_validated=false ;;
+      prompt)
+        if [ -t 0 ]; then
+          echo "$n_validated spec(s) already in validated/. Re-run them too? [y/N] " >&2
+          read -r yn
+          case "$yn" in [yY]|[yY][eE][sS]) include_validated=true ;; esac
+        else
+          include_validated=false
+        fi
+        ;;
+    esac
+  fi
+
+  local run_list="$unvalidated_list"
+  if $include_validated; then
+    run_list+=$'\n'"$validated_list"
+  fi
+
+  local n_total
+  n_total=$(printf '%s' "$run_list" | grep -c . || true)
+  if [ "$n_total" -eq 0 ]; then
+    echo "Nothing to validate." >&2
+    exit 0
+  fi
+
+  # Login once
+  if ! do_login; then
+    echo "Login failed. Check IAP URL/credentials in $CONFIG_FILE." >&2
+    exit 2
+  fi
+
+  $JSON_OUT || echo "Running $n_total spec(s) against $IAP_URL..."
+  $JSON_OUT || echo ""
+
+  local pass_count=0 partial_count=0 fail_count=0
+  local results_json="[]"
+
+  while IFS= read -r spec_path; do
+    [ -z "$spec_path" ] && continue
+    validate_one_spec "$spec_path" "$LOGIN_TOKEN"
+    local rel target
+    rel=$(canonical_relpath "$spec_path")
+    case "$SPEC_VERDICT" in
+      PASS)    target="validated"; pass_count=$((pass_count+1)) ;;
+      PARTIAL) target="partial";   partial_count=$((partial_count+1)) ;;
+      *)       target="failed";    fail_count=$((fail_count+1)) ;;
+    esac
+    local moved="$spec_path"
+    if [ -n "$rel" ]; then
+      moved=$(move_to_bucket "$spec_path" "$target")
+    fi
+    local mark
+    mark=$(verdict_mark "$SPEC_VERDICT")
+    local summary
+    case "$SPEC_VERDICT" in
+      PASS)    summary="PASS ($SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS)" ;;
+      PARTIAL) summary="PARTIAL ($SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS)" ;;
+      *)       summary="FAIL @${SPEC_FAIL_STAGE}: ${SPEC_FAIL_DETAIL}" ;;
+    esac
+    if ! $JSON_OUT; then
+      printf '  [%s] %-50s %s\n' "$mark" "${rel:-$(basename "$spec_path")}" "$summary"
+    fi
+    results_json=$(node -e "
+const arr=JSON.parse(process.argv[1]);
+arr.push({
+  spec: process.argv[2],
+  finalPath: process.argv[3],
+  versionId: process.argv[4],
+  verdict: process.argv[5],
+  expectedOps: parseInt(process.argv[6]||'0',10),
+  actualMethods: process.argv[7] ? parseInt(process.argv[7],10) : null,
+  failStage: process.argv[8] || null,
+  failDetail: process.argv[9] || null,
+  stages: JSON.parse(process.argv[10])
+});
+console.log(JSON.stringify(arr));
+" -- "$results_json" "$spec_path" "$moved" "$SPEC_VERSION_ID" "$SPEC_VERDICT" "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "${SPEC_FAIL_STAGE:-}" "${SPEC_FAIL_DETAIL:-}" "$SPEC_STAGES_JSON")
+  done <<< "$run_list"
+
+  if $JSON_OUT; then
+    node -e "
+console.log(JSON.stringify({
+  total: parseInt(process.argv[1],10),
+  pass: parseInt(process.argv[2],10),
+  partial: parseInt(process.argv[3],10),
+  fail: parseInt(process.argv[4],10),
+  results: JSON.parse(process.argv[5])
+}, null, 2));
+" -- "$n_total" "$pass_count" "$partial_count" "$fail_count" "$results_json"
+  else
+    echo ""
+    echo "=== Bulk Summary ==="
+    echo "Total:    $n_total"
+    echo "PASS:     $pass_count  (-> validated/)"
+    echo "PARTIAL:  $partial_count  (-> partial/)"
+    echo "FAIL:     $fail_count  (-> failed/)"
+  fi
+
+  if [ "$fail_count" -gt 0 ] || [ "$partial_count" -gt 0 ]; then
+    exit 1
+  fi
+  exit 0
+}
+
+cmd_status() {
+  local json_out=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) json_out=true; shift ;;
+      -h|--help) usage ;;
+      *) echo "Unknown status arg: $1" >&2; usage ;;
+    esac
+  done
+  ensure_project_dirs
+  local counts="{}"
+  for b in "${BUCKETS[@]}"; do
+    local n
+    n=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+    counts=$(node -e "const c=$counts; c['$b']=parseInt('$n',10); console.log(JSON.stringify(c));")
+  done
+  if $json_out; then
+    node -e "
+console.log(JSON.stringify({
+  projectRoot: process.argv[1],
+  counts: JSON.parse(process.argv[2])
+}, null, 2));
+" -- "$PROJECT_ROOT" "$counts"
+  else
+    echo "Project root: $PROJECT_ROOT"
+    echo ""
+    for b in "${BUCKETS[@]}"; do
+      local n
+      n=$(node -e "console.log(JSON.parse(process.argv[1])['$b']||0)" -- "$counts")
+      printf '  %-13s %s\n' "$b/" "$n"
+    done
+    echo ""
+    echo "Buckets contain (most recent first):"
+    for b in "${BUCKETS[@]}"; do
+      local listed
+      listed=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | sort | head -10)
+      if [ -n "$listed" ]; then
+        echo "  $b/"
+        while IFS= read -r f; do
+          local rel="${f#$PROJECT_ROOT/$b/}"
+          echo "    $rel"
+        done <<< "$listed"
+        local total
+        total=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$total" -gt 10 ]; then
+          echo "    ... and $((total - 10)) more"
+        fi
+      fi
+    done
+  fi
+}
+
+# --------- dispatch ---------
+SUB="${1:-}"
+case "$SUB" in
+  fetch)   shift; cmd_fetch "$@" ;;
+  bulk)    shift; cmd_bulk "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  help|-h|--help) usage ;;
+  "")      usage ;;
+  *)       cmd_single "$@" ;;
+esac

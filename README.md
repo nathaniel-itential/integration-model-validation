@@ -2,29 +2,22 @@
 
 End-to-end validator for OpenAPI specs intended for Itential integration models. Replaces the manual workflow of: import → create integration → grant role to group → open Studio → check the task palette.
 
-One command tells you whether a spec will successfully import into IAP, and the tasks populate in Studio. 
-This DOES NOT check for task structure/shape, nor does it validate authentication. 
+One command tells you whether a spec produces a working set of callable tasks.
 
 ## Quick start
 
 ```bash
-# 1. Clone the repo
-gh repo clone nathaniel-itential/integration-model-validation
-cd integration-model-validation
+# 1. Install (requires git access to this repo)
+curl -fsSL https://gitlab.com/itential/itential-integration-validator/-/raw/main/install.sh | bash
 
-# 2. Run the install script
-./install.sh
-
-# 3. Edit config if your dev stack differs from defaults:
+# 2. Edit config if your dev stack differs from defaults
 $EDITOR ~/.claude/skills/validate-integration/config.json
 
-# 4. Start your IAP platform (this tool is built against itential-dev-stack)
+# 3. Make sure your IAP dev stack is running
 
-# 5. Validate a spec
-validate-integration openapi.json
+# 4. Validate a spec
+validate-integration /path/to/openapi.json
 ```
-
-This tool is designed to run against [itential-dev-stack](https://github.com/itential/itential-dev-stack) as the primary supported platform.
 
 You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen.
 
@@ -38,7 +31,7 @@ You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen.
 
 ## Usage
 
-### From a terminal
+### Single spec (legacy default)
 
 ```bash
 validate-integration <spec.json>                            # default group from config
@@ -47,15 +40,38 @@ validate-integration <spec.json> --cleanup                  # delete instance + 
 validate-integration <spec.json> --json                     # machine-readable output
 ```
 
-Exit codes: `0` PASS, `1` FAIL/PARTIAL, `2` setup error.
+If the spec lives under `specs/`, it's automatically moved into the matching bucket (`validated/`, `partial/`, `failed/`) after the run. Re-running a spec that's already in `validated/` or `partial/` prompts for confirmation (pass `--force` to skip).
+
+### Bulk validation from the assets repo
+
+```bash
+validate-integration fetch 5                # pull 5 unvalidated specs from github.com/itential/assets
+validate-integration fetch --all            # pull every spec not already in any bucket
+validate-integration fetch --branch main    # use a different branch
+
+validate-integration bulk                   # validate everything in specs/unvalidated/
+validate-integration bulk --rerun           # also re-run specs already in validated/
+validate-integration bulk --no-rerun        # skip the rerun prompt entirely
+
+validate-integration status                 # bucket counts + sample listing
+```
+
+Specs are identified by their `<Vendor>/<Product>/<file>.json` path. After bulk runs they're sorted into `specs/{validated,partial,failed}/`. You can drill into a single failure with the bare-path form:
+
+```bash
+validate-integration specs/failed/Atlassian/Bitbucket/bitbucket_cloud_2.0.json
+```
+
+Exit codes: `0` no failures, `1` at least one FAIL/PARTIAL, `2` setup error.
 
 ### From Claude Code
 
 ```
 /validate-integration /path/to/spec.json
+/validate-integration fetch 10
+/validate-integration bulk
+/validate-integration status
 ```
-
-Or in natural language: "use validate-integration on `/path/to/spec.json`."
 
 ## Config
 
@@ -67,23 +83,21 @@ Or in natural language: "use validate-integration on `/path/to/spec.json`."
   "username": "admin@itential",
   "password": "admin",
   "default_group": "admin_group",
-  "download_path": "/Users/<you>/Downloads"
+  "download_path": "$HOME/Downloads",
+  "project_root": "<repo>/specs",
+  "assets_repo_url": "https://github.com/itential/assets.git",
+  "assets_branch": "add-openapi-specs",
+  "assets_cache_dir": "$HOME/.cache/itential-assets"
 }
 ```
 
-These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git.
+These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git. Re-running `install.sh` migrates older configs in place — your custom values are kept, new keys are filled in.
 
-### `download_path` — pass bare filenames
+### A note on the credentials in this repo
 
-When set, you can drop the directory prefix on specs you keep there:
+`admin@itential` / `admin` appear as literal values in `bin/validate-integration`, `install.sh`, and this README. These are the **publicly documented default credentials for a freshly installed Itential dev stack** — not production secrets. The dev stack runs locally on `localhost:3000`, has no external network exposure, and exists solely for developer testing.
 
-```bash
-validate-integration example.json                  # looks for $DOWNLOAD_PATH/example.json
-validate-integration ./local/file.json             # absolute/relative paths still work as-is
-validate-integration /Users/me/Downloads/foo.json  # fully-qualified paths still work
-```
-
-Path resolution: the CLI first tries the path you gave (so absolute and relative-to-cwd both work). If that doesn't exist AND `download_path` is set, it tries `<download_path>/<your-arg>`. Fails clearly listing both attempts if nothing matches.
+This tool is designed to work *only* against that dev stack. If your organization has changed the defaults or is targeting a different stack, edit `~/.claude/skills/validate-integration/config.json` after install. Automated secret scanners may flag these values; they are intentional and acceptable for this tool's scope.
 
 ## What this validates
 
@@ -104,13 +118,17 @@ The CLI runs six stages, each producing a ✓ or ✗ in the report:
 - Whether configured auth credentials work against the real upstream. Instance is created with `virtual: true`.
 - Whether individual tasks execute end-to-end against a real vendor.
 
+For vendor-accuracy testing, layer this with a Prism mock + a real-vendor smoke call on critical endpoints.
+
 ## Repo layout
 
 ```
 itential-integration-validator/
-├── bin/validate-integration                          # the CLI
+├── bin/validate-integration                          # the CLI (single + fetch + bulk + status)
 ├── .claude/skills/validate-integration/SKILL.md      # Claude Code wrapper
-├── install.sh                                         # one-line installer
+├── specs/                                            # managed spec folder (gitignored contents)
+│   ├── unvalidated/  validated/  partial/  failed/   # buckets, each shipped via .gitkeep
+├── install.sh                                         # one-line installer + config migrator
 ├── README.md
 └── CLAUDE.md                                          # context for Claude in this repo
 ```

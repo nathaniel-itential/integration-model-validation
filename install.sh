@@ -7,7 +7,8 @@
 # One-line usage (after the repo is on an internal git host):
 #   curl -fsSL https://gitlab.com/itential/itential-integration-validator/-/raw/main/install.sh | bash
 #
-# Idempotent: safe to re-run for upgrades. Existing config.json is never overwritten.
+# Idempotent: safe to re-run for upgrades. Existing config.json keeps user values
+# but gains any newly introduced fields.
 
 set -euo pipefail
 
@@ -49,22 +50,47 @@ mkdir -p "$SKILL_DIR"
 install -m 0644 "$REPO_BASE/.claude/skills/validate-integration/SKILL.md" "$SKILL_DIR/SKILL.md"
 echo "Installed skill:  $SKILL_DIR/SKILL.md"
 
-# --------- bootstrap config if missing ---------
+# --------- prepare in-repo specs skeleton ---------
+SPECS_DIR="$REPO_BASE/specs"
+for b in unvalidated validated partial failed; do
+  mkdir -p "$SPECS_DIR/$b"
+  [ -f "$SPECS_DIR/$b/.gitkeep" ] || : > "$SPECS_DIR/$b/.gitkeep"
+done
+echo "Prepared specs:   $SPECS_DIR/{unvalidated,validated,partial,failed}/"
+
+# --------- bootstrap / migrate config ---------
 CONFIG_FILE="$SKILL_DIR/config.json"
-if [ ! -f "$CONFIG_FILE" ]; then
-  cat > "$CONFIG_FILE" <<EOF
+DEFAULTS_JSON=$(cat <<EOF
 {
   "iap_url": "http://localhost:3000",
   "username": "admin@itential",
   "password": "admin",
   "default_group": "admin_group",
-  "download_path": "$HOME/Downloads"
+  "download_path": "$HOME/Downloads",
+  "project_root": "$SPECS_DIR",
+  "assets_repo_url": "https://github.com/itential/assets.git",
+  "assets_branch": "add-openapi-specs",
+  "assets_cache_dir": "$HOME/.cache/itential-assets"
 }
 EOF
+)
+
+if [ ! -f "$CONFIG_FILE" ]; then
+  echo "$DEFAULTS_JSON" > "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
   echo "Created config:   $CONFIG_FILE (edit if your dev stack differs)"
 else
-  echo "Config exists:    $CONFIG_FILE (left untouched)"
+  # Merge: user values win, but any missing keys get the defaults filled in.
+  MERGED=$(DEFAULTS_JSON="$DEFAULTS_JSON" node -e '
+const fs = require("fs");
+const defaults = JSON.parse(process.env.DEFAULTS_JSON);
+const existing = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
+const merged = { ...defaults, ...existing };
+process.stdout.write(JSON.stringify(merged, null, 2) + "\n");
+' "$CONFIG_FILE")
+  echo "$MERGED" > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  echo "Config updated:   $CONFIG_FILE (user values preserved, missing keys filled)"
 fi
 
 # --------- PATH warning ---------
@@ -81,7 +107,10 @@ esac
 # --------- next steps ---------
 echo ""
 echo "Done. Try it:"
-echo "  validate-integration /path/to/your/openapi.json"
+echo "  validate-integration /path/to/your/openapi.json    # single spec"
+echo "  validate-integration fetch 5                       # pull 5 specs from the assets repo"
+echo "  validate-integration bulk                          # validate everything in unvalidated/"
+echo "  validate-integration status                        # show bucket counts"
 echo ""
 echo "Or from Claude Code:"
-echo "  /validate-integration /path/to/your/openapi.json"
+echo "  /validate-integration /path/to/spec.json"

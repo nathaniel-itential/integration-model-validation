@@ -2,3 +2,8 @@
 *.log
 *.tmp
 node_modules/
+
+# Managed specs folder — bucket dirs ship in git (via .gitkeep) but the
+# fetched OpenAPI specs themselves are local-only.
+specs/**/*.json
+!specs/**/.gitkeep
