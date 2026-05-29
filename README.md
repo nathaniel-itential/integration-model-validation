@@ -24,7 +24,7 @@ $EDITOR ~/.claude/skills/validate-integration/config.json
 validate-integration openapi.json
 ```
 
-This tool is designed to run against [itential-dev-stack](https://github.com/itential/itential-dev-stack) as the primary supported platform. Other Itential platform deployments may work if the REST API surface matches, but only the dev stack is regularly verified.
+This tool is designed to run against [itential-dev-stack](https://github.com/itential/itential-dev-stack) as the primary supported platform.
 
 You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen.
 
