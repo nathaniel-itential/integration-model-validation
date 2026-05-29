@@ -41,12 +41,13 @@ done
 # --------- config ---------
 if [ ! -f "$CONFIG_FILE" ]; then
   mkdir -p "$CONFIG_DIR"
-  cat > "$CONFIG_FILE" <<'EOF'
+  cat > "$CONFIG_FILE" <<EOF
 {
   "iap_url": "http://localhost:3000",
   "username": "admin@itential",
   "password": "admin",
-  "default_group": "admin_group"
+  "default_group": "admin_group",
+  "download_path": "$HOME/Downloads"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -57,10 +58,20 @@ IAP_URL=$(node -e "console.log(require('$CONFIG_FILE').iap_url)")
 USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username)")
 PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password)")
 DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group)")
+DOWNLOAD_PATH=$(node -e "const c=require('$CONFIG_FILE'); console.log((c.download_path||'').replace(/^~/, process.env.HOME))")
 GROUP_NAME="${GROUP_OVERRIDE:-$DEFAULT_GROUP}"
 
-# --------- spec sanity ---------
-[ -f "$SPEC_PATH" ] || { echo "Spec file not found: $SPEC_PATH" >&2; exit 2; }
+# --------- spec resolution ---------
+# If the path-as-given doesn't exist, try $DOWNLOAD_PATH/$SPEC_PATH so users can
+# pass bare filenames like `validate-integration example.json`.
+if [ ! -f "$SPEC_PATH" ] && [ -n "$DOWNLOAD_PATH" ] && [ -f "$DOWNLOAD_PATH/$SPEC_PATH" ]; then
+  SPEC_PATH="$DOWNLOAD_PATH/$SPEC_PATH"
+fi
+if [ ! -f "$SPEC_PATH" ]; then
+  echo "Spec file not found: $SPEC_PATH" >&2
+  [ -n "$DOWNLOAD_PATH" ] && echo "  also tried: $DOWNLOAD_PATH/$SPEC_PATH" >&2
+  exit 2
+fi
 
 EXPECTED_OPS=$(node -e "
 const s=require('$SPEC_PATH');

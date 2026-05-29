@@ -60,11 +60,24 @@ Or in natural language: "use validate-integration on `/path/to/spec.json`."
   "iap_url": "http://localhost:3000",
   "username": "admin@itential",
   "password": "admin",
-  "default_group": "admin_group"
+  "default_group": "admin_group",
+  "download_path": "/Users/<you>/Downloads"
 }
 ```
 
 These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git.
+
+### `download_path` — pass bare filenames
+
+When set, you can drop the directory prefix on specs you keep there:
+
+```bash
+validate-integration example.json                  # looks for $DOWNLOAD_PATH/example.json
+validate-integration ./local/file.json             # absolute/relative paths still work as-is
+validate-integration /Users/me/Downloads/foo.json  # fully-qualified paths still work
+```
+
+Path resolution: the CLI first tries the path you gave (so absolute and relative-to-cwd both work). If that doesn't exist AND `download_path` is set, it tries `<download_path>/<your-arg>`. Fails clearly listing both attempts if nothing matches.
 
 ## What this validates
 

@@ -52,12 +52,13 @@ echo "Installed skill:  $SKILL_DIR/SKILL.md"
 # --------- bootstrap config if missing ---------
 CONFIG_FILE="$SKILL_DIR/config.json"
 if [ ! -f "$CONFIG_FILE" ]; then
-  cat > "$CONFIG_FILE" <<'EOF'
+  cat > "$CONFIG_FILE" <<EOF
 {
   "iap_url": "http://localhost:3000",
   "username": "admin@itential",
   "password": "admin",
-  "default_group": "admin_group"
+  "default_group": "admin_group",
+  "download_path": "$HOME/Downloads"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
