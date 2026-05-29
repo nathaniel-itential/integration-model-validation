@@ -226,23 +226,22 @@ move_to_bucket() {
 
 # Find the auto-created admin role for a given integration-model versionId.
 #
-# Two platform quirks make this harder than it should be:
-#   1. /authorization/roles?limit= is capped server-side at 100, so we have to
-#      paginate.
-#   2. Pagination is NOT stable — the list endpoint doesn't sort by _id by
-#      default, and the same `skip=N&limit=100` request can return different
-#      items across calls. Items can shift in and out of pages between
-#      requests, so a single fixed-step walk through skip=0,100,200,... will
-#      silently miss roles.
+# Platform quirks that make this harder than it should be:
+#   1. /authorization/roles?limit= is capped server-side at 100 — must paginate.
+#   2. The list endpoint doesn't sort by _id, and certain _ids consistently
+#      land in gaps between fixed-step page boundaries — so a paginated walk
+#      with step=N can deterministically miss any role whose natural offset
+#      falls in those gaps. Empirically: step=50 misses ~1.5% of roles on a
+#      ~580-role stack; step=25 catches all; step=10 is fully safe.
 #
-# Workaround: walk with overlapping windows (step=50, limit=100) so each role
-# appears in at least two consecutive pages. Stop as soon as we find our
-# target, or after enough consecutive empty pages that we're past the end.
-# Echoes the role _id on stdout, empty string if not found.
-find_admin_role_id() {
-  local local_token="$1" version="$2"
+# Strategy: try a moderately-tight walk (step=25) first. If we miss, retry
+# with a dense walk (step=10) after a short pause that also covers the case
+# where role creation is still settling after import. Bounded by a hard cap
+# on iterations to avoid runaway scans.
+_scan_for_admin_role() {
+  local local_token="$1" version="$2" step="$3"
   local skip page found_id got empty_pages=0
-  for skip in $(seq 0 50 10000); do
+  for skip in $(seq 0 "$step" 10000); do
     page=$(curl -s -H "Cookie: token=$local_token" "$IAP_URL/authorization/roles?limit=100&skip=$skip")
     found_id=$(echo "$page" | node -e "
 try {
@@ -258,11 +257,25 @@ try {
     got=$(echo "$page" | node -e "try {const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));process.stdout.write(String((r.results||[]).length));}catch(e){process.stdout.write('0');}")
     if [ "$got" -eq 0 ]; then
       empty_pages=$((empty_pages + 1))
-      [ "$empty_pages" -ge 3 ] && break  # 3 consecutive empty pages = end of list
+      [ "$empty_pages" -ge 3 ] && break
     else
       empty_pages=0
     fi
   done
+  return 1
+}
+
+find_admin_role_id() {
+  local local_token="$1" version="$2"
+  local result
+  # Pass 1: moderately tight walk — fast path for the common case.
+  result=$(_scan_for_admin_role "$local_token" "$version" 25)
+  if [ -n "$result" ]; then echo "$result"; return 0; fi
+  # Pass 2: brief pause (in case role creation is still settling) then dense
+  # walk to cover the rare-but-possible deeper gaps.
+  sleep 1
+  result=$(_scan_for_admin_role "$local_token" "$version" 10)
+  if [ -n "$result" ]; then echo "$result"; return 0; fi
   echo ""
   return 1
 }
