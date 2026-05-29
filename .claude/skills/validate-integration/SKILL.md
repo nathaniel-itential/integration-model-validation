@@ -17,9 +17,9 @@ This skill is a thin wrapper around the `validate-integration` CLI installed at 
 ## Subcommands
 
 ```bash
-validate-integration <spec.json> [--cleanup] [--group <name>] [--json]   # single spec
-validate-integration fetch [<N> | --all] [--branch <name>]               # pull specs from the assets repo
-validate-integration bulk [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
+validate-integration <spec.json> [--cleanup] [--group <name>] [--json]      # single spec
+validate-integration fetch [<N> | --all] [--branch <name>]                  # pull specs from the assets repo
+validate-integration bulk [--rerun | --no-rerun] [--no-cleanup] [--group <name>] [--json]
 validate-integration status [--json]
 ```
 
@@ -49,7 +49,7 @@ Invoke the CLI with whatever path the user provided. If the user passes a spec a
 Just run it. The CLI clones/pulls a cached copy of `github.com/itential/assets` (branch `add-openapi-specs` by default) and copies any specs not already in the project folder into `specs/unvalidated/`. Print the CLI's "+ <path>" list verbatim.
 
 ### bulk
-Run it as the user asked. The CLI prompts once if there are already-validated specs; if running non-interactively, default is "don't re-run." User can pass `--rerun` to force re-run of validated specs, or `--no-rerun` to skip the prompt and only do unvalidated.
+Run it as the user asked. The CLI prompts once if there are already-validated specs; if running non-interactively, default is "don't re-run." User can pass `--rerun` to force re-run of validated specs, or `--no-rerun` to skip the prompt and only do unvalidated. Bulk cleans up each imported model + instance after validating (since accumulating many of them slows the platform down) — pass `--no-cleanup` to keep them around.
 
 After bulk, look at the summary line counts. If `FAIL > 0`, offer to dig into a specific failed spec: `validate-integration specs/failed/<path>` re-runs it with the full report.
 

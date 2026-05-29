@@ -1,11 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — installs the validate-integration CLI + Claude Code skill.
 #
-# Standalone usage (inside a clone of this repo):
-#   ./install.sh
-#
-# One-line usage (after the repo is on an internal git host):
-#   curl -fsSL https://gitlab.com/itential/itential-integration-validator/-/raw/main/install.sh | bash
+# Usage: clone this repo, then run ./install.sh from inside the clone.
 #
 # Idempotent: safe to re-run for upgrades. Existing config.json keeps user values
 # but gains any newly introduced fields.
@@ -17,25 +13,15 @@ SKILL_DIR="$HOME/.claude/skills/validate-integration"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/validate-integration"
 
-REPO_BASE="${INTEGRATION_VALIDATOR_REPO:-}"
-
-# --------- find or fetch sources ---------
-if [ -z "$REPO_BASE" ]; then
-  # Detect if we're being run from a clone of the repo
-  SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")
-  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/bin/validate-integration" ]; then
-    REPO_BASE="$SCRIPT_DIR"
-    echo "Installing from local clone at $REPO_BASE"
-  else
-    # Curl-piped install: clone to a temp dir
-    REPO_URL="${INTEGRATION_VALIDATOR_GIT:-git@gitlab.com:itential/itential-integration-validator.git}"
-    TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT
-    echo "Cloning $REPO_URL to $TMP..."
-    git clone --depth 1 "$REPO_URL" "$TMP/repo" >/dev/null
-    REPO_BASE="$TMP/repo"
-  fi
+# --------- find sources (must be run from inside the repo) ---------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")
+if [ -z "$SCRIPT_DIR" ] || [ ! -f "$SCRIPT_DIR/bin/validate-integration" ]; then
+  echo "ERROR: install.sh must be run from inside a clone of this repo." >&2
+  echo "  git clone <repo-url> && cd <repo> && ./install.sh" >&2
+  exit 1
 fi
+REPO_BASE="$SCRIPT_DIR"
+echo "Installing from local clone at $REPO_BASE"
 
 [ -f "$REPO_BASE/bin/validate-integration" ] || { echo "ERROR: bin/validate-integration not found in $REPO_BASE"; exit 1; }
 [ -f "$REPO_BASE/.claude/skills/validate-integration/SKILL.md" ] || { echo "ERROR: SKILL.md not found in $REPO_BASE"; exit 1; }

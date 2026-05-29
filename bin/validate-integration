@@ -38,7 +38,7 @@ usage() {
 Usage:
   validate-integration <spec.json> [--cleanup] [--group <name>] [--json] [--force]
   validate-integration fetch [<N> | --all] [--branch <name>]
-  validate-integration bulk  [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
+  validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--group <name>] [--json]
   validate-integration status [--json]
 
 Run 'validate-integration help' for examples and flag details.
@@ -88,7 +88,9 @@ FLAGS
   bulk:
     --rerun           Include specs already in validated/ (no prompt)
     --no-rerun        Skip already-validated specs (no prompt)
-    --cleanup         Delete each imported model + instance after the run
+    --no-cleanup      Keep imported models + instances after each spec
+                      (cleanup is ON by default in bulk — many models bog
+                      the platform down)
     --group <name>    Group override for all specs in the batch
     --json            Emit JSON instead of the per-spec report
 
@@ -666,12 +668,16 @@ cmd_fetch() {
 }
 
 cmd_bulk() {
-  local rerun_mode="prompt" cleanup=false json_out=false group_override=""
+  # Bulk defaults to cleanup=true. Many imported models drag the platform down
+  # (workers reload all integration models on every change), so the batch
+  # tears each one down as it finishes. Pass --no-cleanup to keep them.
+  local rerun_mode="prompt" cleanup=true json_out=false group_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --rerun)    rerun_mode="yes"; shift ;;
-      --no-rerun) rerun_mode="no"; shift ;;
-      --cleanup)  cleanup=true; shift ;;
+      --rerun)      rerun_mode="yes"; shift ;;
+      --no-rerun)   rerun_mode="no"; shift ;;
+      --cleanup)    cleanup=true; shift ;;
+      --no-cleanup) cleanup=false; shift ;;
       --group)    group_override="${2:-}"; shift 2 ;;
       --json)     json_out=true; shift ;;
       -h|--help)  usage ;;
