@@ -8,17 +8,23 @@ This DOES NOT check for task structure/shape, nor does it validate authenticatio
 ## Quick start
 
 ```bash
-# 1. Install (requires git access to this repo)
-curl -fsSL https://gitlab.com/itential/itential-integration-validator/-/raw/main/install.sh | bash
+# 1. Clone the repo
+gh repo clone nathaniel-itential/integration-model-validation
+cd integration-model-validation
 
-# 2. Edit config if your dev stack differs from defaults
+# 2. Run the install script
+./install.sh
+
+# 3. Edit config if your dev stack differs from defaults:
 $EDITOR ~/.claude/skills/validate-integration/config.json
 
-# 3. Make sure your IAP dev stack is running
+# 4. Start your IAP platform (this tool is built against itential-dev-stack)
 
-# 4. Validate a spec
+# 5. Validate a spec
 validate-integration /path/to/openapi.json
 ```
+
+This tool is designed to run against [itential-dev-stack](https://github.com/itential/itential-dev-stack) as the primary supported platform. Other Itential platform deployments may work if the REST API surface matches, but only the dev stack is regularly verified.
 
 You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen.
 
