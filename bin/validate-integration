@@ -205,13 +205,24 @@ move_to_bucket() {
 }
 
 # Find the auto-created admin role for a given integration-model versionId.
-# The platform caps /authorization/roles?limit= at 100 server-side regardless
-# of the requested value, and the equals[] filter is silently ignored, so we
-# must paginate. Echoes the role _id on stdout, empty string if not found.
+#
+# Two platform quirks make this harder than it should be:
+#   1. /authorization/roles?limit= is capped server-side at 100, so we have to
+#      paginate.
+#   2. Pagination is NOT stable — the list endpoint doesn't sort by _id by
+#      default, and the same `skip=N&limit=100` request can return different
+#      items across calls. Items can shift in and out of pages between
+#      requests, so a single fixed-step walk through skip=0,100,200,... will
+#      silently miss roles.
+#
+# Workaround: walk with overlapping windows (step=50, limit=100) so each role
+# appears in at least two consecutive pages. Stop as soon as we find our
+# target, or after enough consecutive empty pages that we're past the end.
+# Echoes the role _id on stdout, empty string if not found.
 find_admin_role_id() {
   local local_token="$1" version="$2"
-  local skip=0 page found_id=""
-  while :; do
+  local skip page found_id got empty_pages=0
+  for skip in $(seq 0 50 10000); do
     page=$(curl -s -H "Cookie: token=$local_token" "$IAP_URL/authorization/roles?limit=100&skip=$skip")
     found_id=$(echo "$page" | node -e "
 try {
@@ -220,13 +231,20 @@ try {
   process.stdout.write(role?._id||'');
 } catch(e) {}
 " -- "$version")
-    [ -n "$found_id" ] && { echo "$found_id"; return 0; }
-    local got
+    if [ -n "$found_id" ]; then
+      echo "$found_id"
+      return 0
+    fi
     got=$(echo "$page" | node -e "try {const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));process.stdout.write(String((r.results||[]).length));}catch(e){process.stdout.write('0');}")
-    [ "$got" -lt 100 ] && { echo ""; return 1; }
-    skip=$((skip + 100))
-    [ "$skip" -gt 5000 ] && { echo ""; return 1; }  # safety bound
+    if [ "$got" -eq 0 ]; then
+      empty_pages=$((empty_pages + 1))
+      [ "$empty_pages" -ge 3 ] && break  # 3 consecutive empty pages = end of list
+    else
+      empty_pages=0
+    fi
   done
+  echo ""
+  return 1
 }
 
 # DELETEs the instance + integration model, then polls the LIST endpoint
@@ -361,8 +379,23 @@ try {
   instance_code=$(echo "$instance_full" | tail -n1 | sed 's/HTTPCODE://')
   instance_body=$(echo "$instance_full" | sed '$d')
 
+  # The platform doesn't always honor the name we POST — for some specs it
+  # returns or reuses an existing instance with a different name. Parse the
+  # response and overwrite instance_name with whatever the platform actually
+  # stored, otherwise cleanup will try to DELETE a name that doesn't exist.
   if [ "$instance_code" -ge 200 ] && [ "$instance_code" -lt 300 ]; then
-    record_local "instance" "true" "HTTP $instance_code (created)"
+    local actual_name
+    actual_name=$(echo "$instance_body" | node -e "
+try {
+  const b=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+  const d=b.data||b;
+  process.stdout.write(d.name||(d.properties&&d.properties.name)||(d.properties&&d.properties.id)||'');
+} catch(e) {}
+")
+    if [ -n "$actual_name" ] && [ "$actual_name" != "$instance_name" ]; then
+      instance_name="$actual_name"
+    fi
+    record_local "instance" "true" "HTTP $instance_code (created, name=$instance_name)"
   elif echo "$instance_body" | grep -qi "already exists\|duplicate"; then
     record_local "instance" "true" "HTTP $instance_code (already exists)"
   else
