@@ -38,7 +38,7 @@ usage() {
 Usage:
   validate-integration <spec.json> [--cleanup] [--group <name>] [--json] [--force]
   validate-integration fetch [<N> | --all] [--branch <name>]
-  validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--group <name>] [--json]
+  validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--throttle <s>] [--group <name>] [--json]
   validate-integration status [--json]
   validate-integration clear [--all | --unvalidated | --validated | --partial | --failed] [--yes]
 
@@ -98,8 +98,15 @@ FLAGS
     --no-cleanup      Keep imported models + instances after each spec
                       (cleanup is ON by default in bulk — many models bog
                       the platform down)
+    --throttle <s>    Seconds to pause between specs (default: 1). Bump
+                      higher if the platform starts returning HTTP 404 or
+                      000 on import mid-run. Set to 0 to disable.
     --group <name>    Group override for all specs in the batch
     --json            Emit JSON instead of the per-spec report
+
+    Bulk also runs a quick platform health check between specs and aborts
+    the run cleanly if the dev stack stops responding, rather than marking
+    every remaining spec as FAIL.
 
   status:
     --json            Emit JSON instead of the formatted listing
@@ -667,6 +674,19 @@ do_login() {
   return 0
 }
 
+# Lightweight liveness check against an already-authenticated endpoint.
+# Used between specs in bulk mode so we abort the run cleanly when the
+# platform falls over mid-batch instead of marching through dozens of
+# misleading per-spec failures. Returns 0 on healthy, non-zero otherwise.
+platform_health() {
+  local local_token="$1"
+  local code
+  code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 \
+    -H "Cookie: token=$local_token" \
+    "$IAP_URL/authorization/accounts?limit=1")
+  [ "$code" = "200" ]
+}
+
 # --------- subcommands ---------
 
 cmd_single() {
@@ -875,13 +895,18 @@ cmd_bulk() {
   # Bulk defaults to cleanup=true. Many imported models drag the platform down
   # (workers reload all integration models on every change), so the batch
   # tears each one down as it finishes. Pass --no-cleanup to keep them.
-  local rerun_mode="prompt" cleanup=true json_out=false group_override=""
+  #
+  # --throttle <seconds> inserts a pause between specs so the platform has
+  # time to settle (worker reloads, GC, mongo connection pool recovery).
+  # Default 1s; bump higher if you start seeing import HTTP 404/000 mid-run.
+  local rerun_mode="prompt" cleanup=true json_out=false group_override="" throttle="1"
   while [ $# -gt 0 ]; do
     case "$1" in
       --rerun)      rerun_mode="yes"; shift ;;
       --no-rerun)   rerun_mode="no"; shift ;;
       --cleanup)    cleanup=true; shift ;;
       --no-cleanup) cleanup=false; shift ;;
+      --throttle)   throttle="${2:-1}"; shift 2 ;;
       --group)    group_override="${2:-}"; shift 2 ;;
       --json)     json_out=true; shift ;;
       -h|--help)  usage ;;
@@ -951,9 +976,28 @@ cmd_bulk() {
 
   local pass_count=0 partial_count=0 fail_count=0
   local results_json="[]"
+  local iter=0
 
   while IFS= read -r spec_path; do
     [ -z "$spec_path" ] && continue
+    # Between specs (not before the first): throttle, then health-check.
+    if [ "$iter" -gt 0 ]; then
+      sleep "$throttle"
+      if ! platform_health "$LOGIN_TOKEN"; then
+        if ! $JSON_OUT; then
+          echo ""
+          echo "=== Bulk aborted ==="
+          echo "Platform health check failed before next spec (sanity ping != HTTP 200)."
+          echo "Progress so far:  PASS=$pass_count PARTIAL=$partial_count FAIL=$fail_count"
+          echo "Remaining:        $((n_total - iter)) spec(s) still in unvalidated/"
+          echo ""
+          echo "The dev stack likely needs a restart. Re-run 'validate-integration bulk'"
+          echo "once it's healthy to continue with the remaining specs."
+        fi
+        exit 2
+      fi
+    fi
+    iter=$((iter + 1))
     validate_one_spec "$spec_path" "$LOGIN_TOKEN"
     local rel target
     rel=$(canonical_relpath "$spec_path")
