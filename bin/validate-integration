@@ -204,12 +204,42 @@ move_to_bucket() {
   echo "$dest"
 }
 
+# Find the auto-created admin role for a given integration-model versionId.
+# The platform caps /authorization/roles?limit= at 100 server-side regardless
+# of the requested value, and the equals[] filter is silently ignored, so we
+# must paginate. Echoes the role _id on stdout, empty string if not found.
+find_admin_role_id() {
+  local local_token="$1" version="$2"
+  local skip=0 page found_id=""
+  while :; do
+    page=$(curl -s -H "Cookie: token=$local_token" "$IAP_URL/authorization/roles?limit=100&skip=$skip")
+    found_id=$(echo "$page" | node -e "
+try {
+  const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+  const role=(r.results||[]).find(x=>x.provenance===process.argv[1] && x.name==='admin');
+  process.stdout.write(role?._id||'');
+} catch(e) {}
+" -- "$version")
+    [ -n "$found_id" ] && { echo "$found_id"; return 0; }
+    local got
+    got=$(echo "$page" | node -e "try {const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));process.stdout.write(String((r.results||[]).length));}catch(e){process.stdout.write('0');}")
+    [ "$got" -lt 100 ] && { echo ""; return 1; }
+    skip=$((skip + 100))
+    [ "$skip" -gt 5000 ] && { echo ""; return 1; }  # safety bound
+  done
+}
+
 # DELETEs the instance + integration model, then polls the LIST endpoint
 # until our versionId is no longer present. The per-id GET endpoint can't be
 # used for verification — it returns HTTP 500 with "Cannot find integration
 # model" for missing models, so the code can't distinguish present from
 # absent. DELETE returning 2xx also doesn't guarantee the worker reload has
 # finished, hence the poll.
+#
+# Note: the auto-created roles for this versionId are NOT cleaned up. The
+# platform protects them ("Cannot delete a non-custom role" on DELETE), and
+# there is no documented cascade. They accumulate over time; restart the
+# dev stack with fresh MongoDB state to reset.
 #
 # Returns 0 if the model is verifiably gone, 1 if it's still in the list
 # after the ~3s timeout.
@@ -351,14 +381,9 @@ try {
     return 1
   fi
 
-  # Step 3: role discovery
-  local roles role_id
-  roles=$(curl -s -H "Cookie: token=$token" "$IAP_URL/authorization/roles?limit=500")
-  role_id=$(echo "$roles" | node -e "
-const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
-const role=(r.results||[]).find(x=>x.provenance===process.argv[1] && x.name==='admin');
-console.log(role?._id||'');
-" -- "$SPEC_VERSION_ID")
+  # Step 3: role discovery (paginated — platform caps page size at 100)
+  local role_id
+  role_id=$(find_admin_role_id "$token" "$SPEC_VERSION_ID")
   if [ -z "$role_id" ]; then
     record_local "role-discovery" "false" "no admin role with provenance=$SPEC_VERSION_ID"
     SPEC_VERDICT="FAIL"
