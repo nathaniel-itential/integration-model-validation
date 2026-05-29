@@ -204,6 +204,29 @@ move_to_bucket() {
   echo "$dest"
 }
 
+# Delete an instance + its integration model, then poll until the model is
+# actually gone (the platform's worker reload is async; DELETE returning 2xx
+# doesn't guarantee memory has been freed). Returns 0 if the model is
+# verifiably gone, 1 if it's still present after the timeout.
+cleanup_one() {
+  local local_token="$1" inst="$2" version="$3"
+  local enc
+  enc=$(node -e "console.log(encodeURIComponent(process.argv[1]))" -- "$version")
+  # Delete instance first (instances reference the model)
+  curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$inst" -H "Cookie: token=$local_token"
+  curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$local_token"
+  # Bounded poll: ~3s max wait for the platform to finish unloading the model
+  local i code
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" -H "Cookie: token=$local_token" "$IAP_URL/integration-models/$enc")
+    if [ "$code" = "404" ]; then
+      return 0
+    fi
+    sleep 0.25
+  done
+  return 1
+}
+
 # --------- per-spec pipeline ---------
 # Inputs: $1 = absolute spec path, $2 = token
 # Optional env: GROUP_NAME, CLEANUP, JSON_OUT, QUIET (=true to suppress full report)
@@ -216,6 +239,9 @@ validate_one_spec() {
   SPEC_FAIL_DETAIL=""
   SPEC_ACTUAL_METHODS=""
   local stages_json="[]"
+  # Flips true once the model is imported on the platform. Any post-import
+  # failure path uses this to know it needs to clean up before returning.
+  local imported=false
 
   local record_local
   record_local() {
@@ -263,8 +289,10 @@ console.log(n);
 
   if [ "$import_code" = "500" ] && echo "$import_body" | grep -q "already exists"; then
     record_local "import" "true" "HTTP 500 (already imported, treating as pass)"
+    imported=true
   elif [ "$import_code" -ge 200 ] && [ "$import_code" -lt 300 ]; then
     record_local "import" "true" "HTTP $import_code"
+    imported=true
   else
     local err_summary
     err_summary=$(echo "$import_body" | node -e "
@@ -299,10 +327,17 @@ try {
     record_local "instance" "true" "HTTP $instance_code (already exists)"
   else
     record_local "instance" "false" "HTTP $instance_code: ${instance_body:0:120}"
-    SPEC_STAGES_JSON="$stages_json"
     SPEC_VERDICT="FAIL"
     SPEC_FAIL_STAGE="instance"
     SPEC_FAIL_DETAIL="HTTP $instance_code: ${instance_body:0:120}"
+    if $imported && [ "${CLEANUP:-false}" = "true" ]; then
+      if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
+        record_local "cleanup" "true" "deleted model (on instance failure)"
+      else
+        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+      fi
+    fi
+    SPEC_STAGES_JSON="$stages_json"
     return 1
   fi
 
@@ -316,10 +351,17 @@ console.log(role?._id||'');
 " -- "$SPEC_VERSION_ID")
   if [ -z "$role_id" ]; then
     record_local "role-discovery" "false" "no admin role with provenance=$SPEC_VERSION_ID"
-    SPEC_STAGES_JSON="$stages_json"
     SPEC_VERDICT="FAIL"
     SPEC_FAIL_STAGE="role-discovery"
     SPEC_FAIL_DETAIL="no admin role with provenance=$SPEC_VERSION_ID"
+    if $imported && [ "${CLEANUP:-false}" = "true" ]; then
+      if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
+        record_local "cleanup" "true" "deleted model + instance (on role-discovery failure)"
+      else
+        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+      fi
+    fi
+    SPEC_STAGES_JSON="$stages_json"
     return 1
   fi
   record_local "role-discovery" "true" "role_id=$role_id"
@@ -339,10 +381,17 @@ const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
 console.log((r.results||[]).map(g=>g.name).join(', '));
 ")
     record_local "authz" "false" "group '$GROUP_NAME' not found. Available: $available"
-    SPEC_STAGES_JSON="$stages_json"
     SPEC_VERDICT="FAIL"
     SPEC_FAIL_STAGE="authz"
     SPEC_FAIL_DETAIL="group '$GROUP_NAME' not found"
+    if $imported && [ "${CLEANUP:-false}" = "true" ]; then
+      if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
+        record_local "cleanup" "true" "deleted model + instance (on authz failure)"
+      else
+        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+      fi
+    fi
+    SPEC_STAGES_JSON="$stages_json"
     return 1
   fi
 
@@ -368,10 +417,17 @@ console.log(JSON.stringify(cur));
       record_local "authz" "true" "group=$GROUP_NAME, HTTP $patch_code (newly granted)"
     else
       record_local "authz" "false" "group=$GROUP_NAME, HTTP $patch_code"
-      SPEC_STAGES_JSON="$stages_json"
       SPEC_VERDICT="FAIL"
       SPEC_FAIL_STAGE="authz"
       SPEC_FAIL_DETAIL="group=$GROUP_NAME, HTTP $patch_code"
+      if $imported && [ "${CLEANUP:-false}" = "true" ]; then
+        if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
+          record_local "cleanup" "true" "deleted model + instance (on authz patch failure)"
+        else
+          record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+        fi
+      fi
+      SPEC_STAGES_JSON="$stages_json"
       return 1
     fi
   fi
@@ -398,13 +454,15 @@ console.log((role.allowedMethods||[]).length);
     SPEC_FAIL_DETAIL="$SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS"
   fi
 
-  # Step 6: optional cleanup
+  # Step 6: optional cleanup (verified — polls until the model is actually
+  # gone before returning, so the next spec doesn't race the platform's
+  # async worker reload)
   if [ "${CLEANUP:-false}" = "true" ]; then
-    curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$instance_name" -H "Cookie: token=$token"
-    local enc
-    enc=$(node -e "console.log(encodeURIComponent('$SPEC_VERSION_ID'))")
-    curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$token"
-    record_local "cleanup" "true" "deleted instance + model"
+    if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
+      record_local "cleanup" "true" "deleted instance + model (verified)"
+    else
+      record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+    fi
   fi
 
   SPEC_STAGES_JSON="$stages_json"
