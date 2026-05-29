@@ -68,6 +68,7 @@ The CLI's report is user-facing. Relay it verbatim, then add a short interpretat
 ### Single-spec verdicts
 - **PASS** — "All N operations became callable tasks. The integration is ready to use in workflows."
 - **PARTIAL** (`methods` stage shows `X/Y` with X < Y) — "The platform imported the spec but dropped (Y-X) operations. Most common cause: duplicate or missing `operationId` values."
+- **FAIL at `auth-check`** — the spec's `components.securitySchemes` uses a type Itential doesn't support. Supported types: `apiKey`, `http` (with `basic` or `bearer`), `oauth2`, `mutualTLS`, `openIdConnect`. The stage detail names the offending scheme. Suggest the user either remove the unsupported scheme or replace it with a supported one (most often `http`/`bearer` is the right substitute).
 - **FAIL at `import`** — first AJV error is in the stage detail. Common patterns:
   - `must NOT have additional properties` on `parse`/`encode`/`encrypt` → adapter-generated spec (`@itentialopensource/adapter-*`). Non-standard schema fields need to be stripped.
   - `exclusiveMinimum must be number` → JSON Schema Draft 4 boolean form (NetBox 4.x and older drf-spectacular output). Convert boolean form to numbers.

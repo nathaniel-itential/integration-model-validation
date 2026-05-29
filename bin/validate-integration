@@ -112,6 +112,19 @@ FLAGS
     --failed          Empty failed/
     --yes, -y         Skip the confirmation prompt (required for non-interactive use)
 
+STAGES (per spec)
+  login           authenticate against the dev stack
+  auth-check      verify spec's components.securitySchemes only uses
+                  Itential-supported types (apiKey, http with basic/bearer,
+                  oauth2, mutualTLS, openIdConnect). Fails fast before
+                  touching the platform.
+  import          POST the spec; canonical AJV validation
+  instance        create a virtual instance from the model
+  role-discovery  find the auto-created admin role for the versionId
+  authz           grant the role to the configured group
+  methods         verify role.allowedMethods.length == operation count
+  cleanup         (optional) delete instance + model, verify gone
+
 EXIT CODES
   0   PASS (single) or no failures (bulk/fetch/status)
   1   at least one spec FAILed or was PARTIAL
@@ -331,6 +344,56 @@ console.log(n);
 ")
   local instance_name
   instance_name=$(echo "$title" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
+
+  # Step 0.5: auth pre-flight
+  # Verify the spec's components.securitySchemes only uses types Itential
+  # supports. Per the platform docs (admin-essentials/integrations/auth/
+  # security-schemes), supported types are: apiKey, http (with scheme=basic
+  # or bearer), oauth2, mutualTLS, openIdConnect. The platform also only
+  # honors the FIRST scheme listed, so we surface a note when multiple are
+  # defined. Failing here saves a wasted import for clearly-incompatible
+  # specs.
+  local auth_result
+  auth_result=$(node -e "
+const s=require('$spec_path');
+const schemes=(s.components||{}).securitySchemes||{};
+const entries=Object.entries(schemes);
+if (entries.length===0) { console.log('OK|no security schemes defined'); process.exit(0); }
+const SUPPORTED=new Set(['apikey','http','oauth2','mutualtls','openidconnect']);
+const HTTP_OK=new Set(['basic','bearer']);
+const bad=[];
+const summary=[];
+for (const [name, sc] of entries) {
+  const t=(sc.type||'').toLowerCase();
+  if (!SUPPORTED.has(t)) {
+    bad.push(\`'\${name}' uses unsupported type '\${sc.type||'(missing)'}'\`);
+    continue;
+  }
+  if (t==='http') {
+    const sub=(sc.scheme||'').toLowerCase();
+    if (!HTTP_OK.has(sub)) {
+      bad.push(\`'\${name}' is http but uses unsupported scheme '\${sc.scheme||'(missing)'}'\`);
+      continue;
+    }
+    summary.push(\`\${name}:http/\${sub}\`);
+  } else {
+    summary.push(\`\${name}:\${sc.type}\`);
+  }
+}
+if (bad.length) { console.log('FAIL|'+bad.join('; ')); process.exit(0); }
+const note = entries.length>1 ? \` (note: \${entries.length} schemes defined — platform honors only the first)\` : '';
+console.log('OK|'+summary.join(', ')+note);
+")
+  local auth_status="${auth_result%%|*}" auth_detail="${auth_result#*|}"
+  if [ "$auth_status" = "FAIL" ]; then
+    record_local "auth-check" "false" "$auth_detail"
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="auth-check"
+    SPEC_FAIL_DETAIL="$auth_detail"
+    SPEC_STAGES_JSON="$stages_json"
+    return 1
+  fi
+  record_local "auth-check" "true" "$auth_detail"
 
   # Step 1: import
   local tmp_body

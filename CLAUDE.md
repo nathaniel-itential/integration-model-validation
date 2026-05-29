@@ -41,11 +41,13 @@ Specs are identified by their `<Vendor>/<Product>/<file>.json` relative path. Th
 | Stage | What it does | Endpoint |
 |---|---|---|
 | `login` | Log in, sanity-ping an authenticated endpoint | `POST /login` → `GET /authorization/accounts?limit=1` |
+| `auth-check` | Verify the spec's `components.securitySchemes` only declares types Itential supports (apiKey / http-basic-or-bearer / oauth2 / mutualTLS / openIdConnect). Pre-flight, no platform call. | (none) |
 | `import` | Submit the spec; this is the canonical platform validation | `POST /integration-models` |
-| `instance` | Create a `virtual: true` codeless instance | `POST /integrations` |
-| `role-discovery` | Find the auto-created admin role keyed by `provenance == versionId` | `GET /authorization/roles?limit=500` |
+| `instance` | Create a `virtual: true` codeless instance. Parse the response and overwrite our derived instance name with whatever the platform actually stored — it doesn't always honor the requested name. | `POST /integrations` |
+| `role-discovery` | Find the auto-created admin role keyed by `provenance == versionId`. Paginates with overlapping windows (step=50, limit=100) because the role list endpoint isn't stably ordered between calls. | `GET /authorization/roles?limit=100&skip=N` |
 | `authz` | Patch the named group's `assignedRoles` (full-replacement, idempotent) | `PATCH /authorization/groups/{id}` |
 | `methods` | Read `role.allowedMethods.length`; compare to operation count in spec | `GET /authorization/roles/{id}` |
+| `cleanup` | Optional. Delete the instance then the model, poll the integration-models list until the model is verifiably gone. Auto-created roles are NOT deleted — the platform refuses with "Cannot delete a non-custom role", so they accumulate. | `DELETE /integrations/{name}` → `DELETE /integration-models/{enc-versionId}` |
 
 `methods` count == operation count is the canonical PASS signal. There is no `/apps/list` endpoint on this IAP version — don't try to use one. In bulk mode, login happens once and the token is reused across all per-spec runs.
 
