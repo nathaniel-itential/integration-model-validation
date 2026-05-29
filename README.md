@@ -7,19 +7,20 @@ One command tells you whether a spec produces a working set of callable tasks.
 ## Quick start
 
 ```bash
-# 1. Install (requires git access to this repo)
-curl -fsSL https://gitlab.com/itential/itential-integration-validator/-/raw/main/install.sh | bash
+# 1. Clone this repo (any method — HTTPS, SSH, gh CLI, etc.)
+git clone https://github.com/nathaniel-itential/integration-model-validation.git
+cd integration-model-validation
 
-# 2. Edit config if your dev stack differs from defaults
+# 2. Run the installer
+./install.sh
+
+# 3. Edit config if your dev stack differs from defaults
 $EDITOR ~/.claude/skills/validate-integration/config.json
 
-# 3. Make sure your IAP dev stack is running
-
-# 4. Validate a spec
-validate-integration /path/to/openapi.json
+# 4. Make sure your IAP dev stack is running
 ```
 
-You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen.
+You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen for each spec you validate.
 
 ## What gets installed
 
@@ -93,12 +94,6 @@ Exit codes: `0` no failures, `1` at least one FAIL/PARTIAL, `2` setup error.
 
 These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git. Re-running `install.sh` migrates older configs in place — your custom values are kept, new keys are filled in.
 
-### A note on the credentials in this repo
-
-`admin@itential` / `admin` appear as literal values in `bin/validate-integration`, `install.sh`, and this README. These are the **publicly documented default credentials for a freshly installed Itential dev stack** — not production secrets. The dev stack runs locally on `localhost:3000`, has no external network exposure, and exists solely for developer testing.
-
-This tool is designed to work *only* against that dev stack. If your organization has changed the defaults or is targeting a different stack, edit `~/.claude/skills/validate-integration/config.json` after install. Automated secret scanners may flag these values; they are intentional and acceptable for this tool's scope.
-
 ## What this validates
 
 The CLI runs six stages, each producing a ✓ or ✗ in the report:
@@ -117,8 +112,6 @@ The CLI runs six stages, each producing a ✓ or ✗ in the report:
 - Whether the spec describes the *real* vendor API correctly. Platform validation is structural, not semantic.
 - Whether configured auth credentials work against the real upstream. Instance is created with `virtual: true`.
 - Whether individual tasks execute end-to-end against a real vendor.
-
-For vendor-accuracy testing, layer this with a Prism mock + a real-vendor smoke call on critical endpoints.
 
 ## Repo layout
 

@@ -36,12 +36,70 @@ BUCKETS=(unvalidated validated partial failed)
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
+  validate-integration <spec.json> [--cleanup] [--group <name>] [--json] [--force]
   validate-integration fetch [<N> | --all] [--branch <name>]
   validate-integration bulk  [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
   validate-integration status [--json]
+
+Run 'validate-integration help' for examples and flag details.
 EOF
   exit 2
+}
+
+print_help() {
+  cat <<'EOF'
+USAGE
+  validate-integration <spec.json> [flags]    # validate one spec
+  validate-integration fetch <N|--all>         # pull specs from the assets repo
+  validate-integration bulk [flags]            # validate every spec in unvalidated/
+  validate-integration status                  # show bucket counts + listing
+  validate-integration help                    # this screen
+
+EXAMPLES
+  # Validate a single spec by path (Downloads shortcuts work too)
+  validate-integration ~/Downloads/foo.json
+  validate-integration foo.json                  # resolves under download_path
+
+  # Pull and bulk-test from the assets repo
+  validate-integration fetch 10                  # pull 10 unvalidated specs
+  validate-integration fetch --all               # pull every spec not yet local
+  validate-integration bulk                      # validate them all
+  validate-integration bulk --rerun              # also re-run validated/ specs
+
+  # Inspect state
+  validate-integration status                    # human-readable
+  validate-integration status --json             # machine-readable
+
+  # Drill into a specific failure after a bulk run
+  validate-integration specs/failed/Akamai/akamai_api.json
+
+FLAGS
+  Single-spec mode:
+    --cleanup         Delete the imported model + instance after the run
+    --group <name>    Grant the role to this group (default: from config)
+    --json            Emit JSON instead of the formatted report
+    --force           Skip the "spec already in validated/partial — rerun?" prompt
+
+  fetch:
+    <N>               Number of specs to pull (must be a non-negative integer)
+    --all             Pull every spec not already in any bucket
+    --branch <name>   Use a non-default branch of the assets repo
+
+  bulk:
+    --rerun           Include specs already in validated/ (no prompt)
+    --no-rerun        Skip already-validated specs (no prompt)
+    --cleanup         Delete each imported model + instance after the run
+    --group <name>    Group override for all specs in the batch
+    --json            Emit JSON instead of the per-spec report
+
+  status:
+    --json            Emit JSON instead of the formatted listing
+
+EXIT CODES
+  0   PASS (single) or no failures (bulk/fetch/status)
+  1   at least one spec FAILed or was PARTIAL
+  2   setup error (bad args, missing config, login failed, stack unreachable)
+EOF
 }
 
 # --------- bootstrap config ---------
@@ -809,7 +867,7 @@ case "$SUB" in
   fetch)   shift; cmd_fetch "$@" ;;
   bulk)    shift; cmd_bulk "$@" ;;
   status)  shift; cmd_status "$@" ;;
-  help|-h|--help) usage ;;
+  help|-h|--help) print_help; exit 0 ;;
   "")      usage ;;
   *)       cmd_single "$@" ;;
 esac
