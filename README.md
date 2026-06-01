@@ -5,7 +5,7 @@ End-to-end validator for OpenAPI specs intended for Itential integration models.
 One command tells you whether a spec produces a working set of callable tasks.
 
 ## Quick start
-
+**Mac/Linux** system required, Windows is not compatible. 
 ```bash
 # 1. Clone this repo (any method — HTTPS, SSH, gh CLI, etc.)
 git clone https://github.com/nathaniel-itential/integration-model-validation.git
