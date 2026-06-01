@@ -8,7 +8,7 @@ One command tells you whether a spec produces a working set of callable tasks.
 >
 > **This tool is intended for a local dev stack that is dedicated to spec validation — not a stack where someone else is doing other work.**
 >
-> Validating a spec imports an integration model and a virtual instance into the platform, then deletes them. Bulk runs do this hundreds of times in succession. Over time, the platform accumulates orphan roles in MongoDB and in-memory state in the worker process; recovery sometimes requires restarting the platform's container (see `platform-reset` below). Any of these operations will disrupt other testing happening on the same stack.
+> Validating a spec imports an integration model and a virtual instance into the platform, then deletes them. Bulk runs may do this hundreds of times in succession. Over time, the platform accumulates orphan roles in MongoDB and in-memory state in the worker process; recovery sometimes requires restarting the platform's container (see `platform-reset` below). Any of these operations will disrupt other testing happening on the same stack.
 >
 > Pointing this tool at a shared / preprod / production stack would create noise, may break others' in-progress work, and could leak credentials into Redis/MongoDB if the configured `admin@itential / admin` defaults don't match the target stack.
 
