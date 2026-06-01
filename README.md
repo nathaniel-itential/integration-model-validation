@@ -103,7 +103,7 @@ Exit codes: `0` no failures, `1` at least one FAIL/PARTIAL, `2` setup error.
 
 These are the shared internal dev-stack defaults. Edit if your local setup differs. The file is `chmod 600` and not in git. Re-running `install.sh` migrates older configs in place — your custom values are kept, new keys are filled in.
 
-> **Note on `admin@itential` / `admin`:** these are the documented defaults for a freshly installed Itential dev stack running on `localhost`. They're intended for local use only — replace them in `config.json` if your stack is configured differently.
+> **Note on `admin@itential` / `admin`:** these are the documented defaults for a freshly installed Itential dev stack running on `localhost`. They're intended for local use only.
 
 ## What this validates
 
