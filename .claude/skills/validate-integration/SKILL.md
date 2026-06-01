@@ -53,7 +53,7 @@ Just run it. The CLI clones/pulls a cached copy of `github.com/itential/assets` 
 ### bulk
 Run it as the user asked. The CLI prompts once if there are already-validated specs; if running non-interactively, default is "don't re-run." User can pass `--rerun` to force re-run of validated specs, or `--no-rerun` to skip the prompt and only do unvalidated. Bulk cleans up each imported model + instance after validating (since accumulating many of them slows the platform down) — pass `--no-cleanup` to keep them around.
 
-Between specs, bulk sleeps `--throttle <seconds>` (default 1) and runs a platform health check. If the dev stack stops responding mid-batch, bulk aborts cleanly with a summary of how many were validated so far — instead of marching through the rest as misleading per-spec failures. Suggest bumping `--throttle` to 2–3 if a user reports import HTTP 404 or HTTP 000 errors mid-run.
+Between specs, bulk runs a platform health check and optionally sleeps `--throttle <seconds>` (default 0 — no pause). If the dev stack stops responding mid-batch, bulk aborts cleanly with a summary of how many were validated so far — instead of marching through the rest as misleading per-spec failures. Suggest bumping `--throttle` to 1–3 if a user reports import HTTP 404 or HTTP 000 errors mid-run.
 
 After bulk, look at the summary line counts. If `FAIL > 0`, offer to dig into a specific failed spec: `validate-integration specs/failed/<path>` re-runs it with the full report. If the run ABORTED (exit 2 with "Bulk aborted"), the platform itself is the issue, not the specs — recommend restarting the dev stack before continuing.
 

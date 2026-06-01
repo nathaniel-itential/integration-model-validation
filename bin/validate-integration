@@ -98,9 +98,9 @@ FLAGS
     --no-cleanup      Keep imported models + instances after each spec
                       (cleanup is ON by default in bulk — many models bog
                       the platform down)
-    --throttle <s>    Seconds to pause between specs (default: 1). Bump
-                      higher if the platform starts returning HTTP 404 or
-                      000 on import mid-run. Set to 0 to disable.
+    --throttle <s>    Seconds to pause between specs (default: 0). Bump
+                      to 1–3 if the platform starts returning HTTP 404 or
+                      000 on import mid-run.
     --group <name>    Group override for all specs in the batch
     --json            Emit JSON instead of the per-spec report
 
@@ -285,20 +285,29 @@ find_admin_role_id() {
   return 1
 }
 
-# DELETEs the instance + integration model, then polls the LIST endpoint
-# until our versionId is no longer present. The per-id GET endpoint can't be
-# used for verification — it returns HTTP 500 with "Cannot find integration
-# model" for missing models, so the code can't distinguish present from
-# absent. DELETE returning 2xx also doesn't guarantee the worker reload has
-# finished, hence the poll.
+# DELETEs the instance + integration model, then verifies the model is gone
+# by polling the single-model endpoint until it stops returning 200.
 #
-# Note: the auto-created roles for this versionId are NOT cleaned up. The
-# platform protects them ("Cannot delete a non-custom role" on DELETE), and
-# there is no documented cascade. They accumulate over time; restart the
-# dev stack with fresh MongoDB state to reset.
+# versionId is a unique identifier (title:version, enforced unique by the
+# platform), so we can look up exactly one document by encoding it into the
+# URL. The endpoint returns HTTP 200 with the model body when present, and
+# HTTP 500 with body "Cannot find integration model ..." when absent — so
+# any non-200 response means the platform no longer has it. Much cheaper
+# than the previous approach of fetching a 100-doc page and searching it.
 #
-# Returns 0 if the model is verifiably gone, 1 if it's still in the list
-# after the ~3s timeout.
+# We still poll briefly because DELETE returns 2xx before the worker reload
+# completes; in practice the first GET after DELETE is usually already
+# non-200, but we allow up to ~1.5s for slow unloads.
+#
+# Note: the auto-created roles for this versionId are NOT removed by the
+# model DELETE — only the model document goes away. The direct role-DELETE
+# endpoint refuses auto-created roles ("Cannot delete a non-custom role"),
+# so no API path retires them. They accumulate across runs until the dev
+# stack's MongoDB state is wiped. Re-importing the same versionId is safe
+# — existing roles are reused (upserted) rather than duplicated.
+#
+# Returns 0 if the model is verifiably gone, 1 if it's still present after
+# the timeout.
 cleanup_one() {
   local local_token="$1" inst="$2" version="$3"
   # Delete instance first — instances reference the model and block its deletion.
@@ -306,18 +315,10 @@ cleanup_one() {
   local enc
   enc=$(node -e "console.log(encodeURIComponent(process.argv[1]))" -- "$version")
   curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$local_token"
-  local i present
-  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    present=$(curl -s -H "Cookie: token=$local_token" "$IAP_URL/integration-models?limit=500" | node -e "
-try {
-  const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));
-  const list=r.integrationModels||r.results||[];
-  process.stdout.write(list.some(m=>m.versionId===process.argv[1])?'yes':'no');
-} catch(e) { process.stdout.write('unknown'); }
-" -- "$version")
-    if [ "$present" = "no" ]; then
-      return 0
-    fi
+  local i code
+  for i in 1 2 3 4 5 6; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" -H "Cookie: token=$local_token" "$IAP_URL/integration-models/$enc")
+    [ "$code" != "200" ] && return 0
     sleep 0.25
   done
   return 1
@@ -914,10 +915,10 @@ cmd_bulk() {
   # (workers reload all integration models on every change), so the batch
   # tears each one down as it finishes. Pass --no-cleanup to keep them.
   #
-  # --throttle <seconds> inserts a pause between specs so the platform has
-  # time to settle (worker reloads, GC, mongo connection pool recovery).
-  # Default 1s; bump higher if you start seeing import HTTP 404/000 mid-run.
-  local rerun_mode="prompt" cleanup=true json_out=false group_override="" throttle="1"
+  # --throttle <seconds> inserts a pause between specs. Default 0 (no pause);
+  # bump to 1–3s if you start seeing import HTTP 404/000 mid-run, which means
+  # the platform's workers aren't keeping up with the reload churn.
+  local rerun_mode="prompt" cleanup=true json_out=false group_override="" throttle="0"
   while [ $# -gt 0 ]; do
     case "$1" in
       --rerun)      rerun_mode="yes"; shift ;;
