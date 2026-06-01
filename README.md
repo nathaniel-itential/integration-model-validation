@@ -28,7 +28,7 @@ You'll get a PASS/PARTIAL/FAIL verdict with per-stage diagnostics in one screen 
 |---|---|
 | `~/.local/bin/validate-integration` | The CLI — does all the work |
 | `~/.claude/skills/validate-integration/SKILL.md` | Claude Code skill — invokes the CLI when you type `/validate-integration` |
-| `~/.claude/skills/validate-integration/config.json` | Dev stack URL + credentials + default group (created on first run, never overwritten) |
+| `~/.claude/skills/validate-integration/config.json` | Dev stack URL + credentials + default group + current asset branch |
 
 ## Usage
 
