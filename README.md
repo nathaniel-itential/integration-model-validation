@@ -4,6 +4,14 @@ End-to-end validator for OpenAPI specs intended for Itential integration models.
 
 One command tells you whether a spec produces a working set of callable tasks.
 
+> ### ⚠ Scope of use
+>
+> **This tool is intended for a local dev stack that is dedicated to spec validation — not a stack where someone else is doing other work.**
+>
+> Validating a spec imports an integration model and a virtual instance into the platform, then deletes them. Bulk runs do this hundreds of times in succession. Over time, the platform accumulates orphan roles in MongoDB and in-memory state in the worker process; recovery sometimes requires restarting the platform's container (see `platform-reset` below). Any of these operations will disrupt other testing happening on the same stack.
+>
+> Pointing this tool at a shared / preprod / production stack would create noise, may break others' in-progress work, and could leak credentials into Redis/MongoDB if the configured `admin@itential / admin` defaults don't match the target stack.
+
 ## Quick start
 **Mac/Linux** system required, Windows is not compatible. 
 ```bash
@@ -65,6 +73,18 @@ validate-integration clear --all --yes       # skip the confirmation
 Bulk runs delete each imported model and instance after validating, since accumulating many models slows the platform down significantly. Pass `--no-cleanup` if you want to keep them around for inspection.
 
 `clear` only removes the local spec files — integration models already imported into the IAP stack are not affected.
+
+### When bulk crashes mid-run: `platform-reset`
+
+```bash
+validate-integration platform-reset
+```
+
+Over the course of a few back-to-back bulk runs, the platform's worker process accumulates in-memory state (leaked references, retained closures, socket pools) that it can't shed on its own. Eventually a bulk run will trip the validator's health check and abort with a "Platform health check failed" message.
+
+`platform-reset` runs `docker restart <platform_container>` and polls until `POST /login` returns 200. **MongoDB, Redis, and all on-disk data are untouched** — only the platform's Node process is recycled, which is enough to clear the leak. Total time: ~30 seconds.
+
+> **Same scope-of-use caveat applies.** This restarts the platform container, which interrupts anything else running against that stack. Only use against a dev stack dedicated to validation. If your container has a name other than `platform`, edit `platform_container` in `config.json`.
 
 Specs are identified by their `<Vendor>/<Product>/<file>.json` path. After bulk runs they're sorted into `specs/{validated,partial,failed}/`. You can drill into a single failure with the bare-path form:
 

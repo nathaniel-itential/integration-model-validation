@@ -56,7 +56,8 @@ DEFAULTS_JSON=$(cat <<EOF
   "project_root": "$SPECS_DIR",
   "assets_repo_url": "https://github.com/itential/assets.git",
   "assets_branch": "add-openapi-specs",
-  "assets_cache_dir": "$HOME/.cache/itential-assets"
+  "assets_cache_dir": "$HOME/.cache/itential-assets",
+  "platform_container": "platform"
 }
 EOF
 )

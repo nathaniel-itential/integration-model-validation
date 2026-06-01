@@ -41,6 +41,7 @@ Usage:
   validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--throttle <s>] [--group <name>] [--json]
   validate-integration status [--json]
   validate-integration clear [--all | --unvalidated | --validated | --partial | --failed] [--yes]
+  validate-integration platform-reset
 
 Run 'validate-integration help' for examples and flag details.
 EOF
@@ -55,6 +56,7 @@ USAGE
   validate-integration bulk [flags]            # validate every spec in unvalidated/
   validate-integration status                  # show bucket counts + listing
   validate-integration clear <bucket-flags>    # delete local specs from buckets
+  validate-integration platform-reset          # restart the platform container (clears in-memory bloat)
   validate-integration help                    # this screen
 
 EXAMPLES
@@ -119,6 +121,16 @@ FLAGS
     --failed          Empty failed/
     --yes, -y         Skip the confirmation prompt (required for non-interactive use)
 
+  platform-reset:
+    (no flags)        Runs 'docker restart <platform_container>' and waits up
+                      to 120s for the dev stack to become healthy again.
+                      Clears in-memory leaks that accumulate across many bulk
+                      runs. Mongo and Redis state are NOT touched — only the
+                      platform Node process is recycled.
+                      ONLY use on a local dev stack dedicated to spec
+                      validation. Restarting a stack where someone else is
+                      mid-test will interrupt their work.
+
 STAGES (per spec)
   login           authenticate against the dev stack
   auth-check      verify spec's components.securitySchemes only uses
@@ -152,7 +164,8 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "project_root": "$DEFAULT_PROJECT_ROOT",
   "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
   "assets_branch": "$DEFAULT_ASSETS_BRANCH",
-  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE"
+  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE",
+  "platform_container": "platform"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -168,6 +181,7 @@ PROJECT_ROOT=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.project
 ASSETS_REPO_URL=$(node -e "console.log(require('$CONFIG_FILE').assets_repo_url || '$DEFAULT_ASSETS_REPO_URL')")
 ASSETS_BRANCH=$(node -e "console.log(require('$CONFIG_FILE').assets_branch || '$DEFAULT_ASSETS_BRANCH')")
 ASSETS_CACHE_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_cache_dir||'$DEFAULT_ASSETS_CACHE')).replace(/^~/, process.env.HOME))")
+PLATFORM_CONTAINER=$(node -e "console.log(require('$CONFIG_FILE').platform_container || 'platform')")
 
 ensure_project_dirs() {
   for b in "${BUCKETS[@]}"; do
@@ -1010,8 +1024,11 @@ cmd_bulk() {
           echo "Progress so far:  PASS=$pass_count PARTIAL=$partial_count FAIL=$fail_count"
           echo "Remaining:        $((n_total - iter)) spec(s) still in unvalidated/"
           echo ""
-          echo "The dev stack likely needs a restart. Re-run 'validate-integration bulk'"
-          echo "once it's healthy to continue with the remaining specs."
+          echo "Try:   validate-integration platform-reset"
+          echo "Then:  validate-integration bulk"
+          echo ""
+          echo "platform-reset restarts the platform's Node process to clear leaked"
+          echo "in-memory state. Your mongo data and other configuration are preserved."
         fi
         exit 2
       fi
@@ -1192,13 +1209,67 @@ cmd_clear() {
   echo "Note: this only removes local files. Imported models on the IAP stack are unaffected."
 }
 
+# Restart the platform container to clear in-memory bloat that builds up after
+# many bulk runs (leaked global.config arrays, lingering sockets, etc.). Data
+# in mongo/redis is untouched — only the platform's Node process is recycled.
+# This is the lightest-weight fix when bulk starts crashing mid-run.
+cmd_platform_reset() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage ;;
+      *) echo "Unknown platform-reset arg: $1" >&2; usage ;;
+    esac
+  done
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "platform-reset: 'docker' not found on PATH." >&2
+    echo "  This subcommand assumes a docker-based dev stack. If your IAP" >&2
+    echo "  runs elsewhere, restart the platform process by whatever means" >&2
+    echo "  your setup uses (systemd, pm2, etc.)." >&2
+    exit 2
+  fi
+
+  if ! docker inspect "$PLATFORM_CONTAINER" >/dev/null 2>&1; then
+    echo "platform-reset: container '$PLATFORM_CONTAINER' not found." >&2
+    echo "  Edit 'platform_container' in $CONFIG_FILE if your container name differs." >&2
+    exit 2
+  fi
+
+  echo "Restarting container '$PLATFORM_CONTAINER'..."
+  if ! docker restart "$PLATFORM_CONTAINER" >/dev/null 2>&1; then
+    echo "platform-reset: 'docker restart $PLATFORM_CONTAINER' failed." >&2
+    exit 2
+  fi
+
+  printf "Waiting for the platform to become healthy"
+  local elapsed=0 max=120 code
+  while [ "$elapsed" -lt "$max" ]; do
+    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -X POST "$IAP_URL/login" \
+      -H "Content-Type: application/json" \
+      -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}" 2>/dev/null)
+    if [ "$code" = "200" ]; then
+      echo ""
+      echo "Platform healthy after ${elapsed}s."
+      return 0
+    fi
+    printf "."
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  echo ""
+  echo "platform-reset: platform did not become healthy within ${max}s." >&2
+  echo "  Check 'docker logs $PLATFORM_CONTAINER' for startup errors." >&2
+  exit 2
+}
+
 # --------- dispatch ---------
 SUB="${1:-}"
 case "$SUB" in
-  fetch)   shift; cmd_fetch "$@" ;;
-  bulk)    shift; cmd_bulk "$@" ;;
-  status)  shift; cmd_status "$@" ;;
-  clear)   shift; cmd_clear "$@" ;;
+  fetch)            shift; cmd_fetch "$@" ;;
+  bulk)             shift; cmd_bulk "$@" ;;
+  status)           shift; cmd_status "$@" ;;
+  clear)            shift; cmd_clear "$@" ;;
+  platform-reset)   shift; cmd_platform_reset "$@" ;;
   help|-h|--help) print_help; exit 0 ;;
   "")      usage ;;
   *)       cmd_single "$@" ;;
