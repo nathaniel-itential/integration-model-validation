@@ -36,14 +36,6 @@ mkdir -p "$SKILL_DIR"
 install -m 0644 "$REPO_BASE/.claude/skills/validate-integration/SKILL.md" "$SKILL_DIR/SKILL.md"
 echo "Installed skill:  $SKILL_DIR/SKILL.md"
 
-# --------- prepare in-repo specs skeleton ---------
-SPECS_DIR="$REPO_BASE/specs"
-for b in unvalidated validated partial failed; do
-  mkdir -p "$SPECS_DIR/$b"
-  [ -f "$SPECS_DIR/$b/.gitkeep" ] || : > "$SPECS_DIR/$b/.gitkeep"
-done
-echo "Prepared specs:   $SPECS_DIR/{unvalidated,validated,partial,failed}/"
-
 # --------- bootstrap / migrate config ---------
 CONFIG_FILE="$SKILL_DIR/config.json"
 DEFAULTS_JSON=$(cat <<EOF
@@ -53,7 +45,6 @@ DEFAULTS_JSON=$(cat <<EOF
   "password": "admin",
   "default_group": "admin_group",
   "download_path": "$HOME/Downloads",
-  "project_root": "$SPECS_DIR",
   "assets_repo_url": "https://github.com/itential/assets.git",
   "assets_branch": "add-openapi-specs",
   "assets_cache_dir": "$HOME/.cache/itential-assets",
@@ -68,11 +59,14 @@ if [ ! -f "$CONFIG_FILE" ]; then
   echo "Created config:   $CONFIG_FILE (edit if your dev stack differs)"
 else
   # Merge: user values win, but any missing keys get the defaults filled in.
+  # Also removes stale keys (e.g. project_root) that no longer exist in the schema.
   MERGED=$(DEFAULTS_JSON="$DEFAULTS_JSON" node -e '
 const fs = require("fs");
 const defaults = JSON.parse(process.env.DEFAULTS_JSON);
 const existing = JSON.parse(fs.readFileSync(process.argv[1], "utf-8"));
-const merged = { ...defaults, ...existing };
+// Only keep keys that exist in defaults (drops removed keys like project_root)
+const merged = {};
+for (const k of Object.keys(defaults)) merged[k] = existing[k] ?? defaults[k];
 process.stdout.write(JSON.stringify(merged, null, 2) + "\n");
 ' "$CONFIG_FILE")
   echo "$MERGED" > "$CONFIG_FILE"
@@ -94,10 +88,10 @@ esac
 # --------- next steps ---------
 echo ""
 echo "Done. Try it:"
-echo "  validate-integration /path/to/your/openapi.json    # single spec"
-echo "  validate-integration fetch 5                       # pull 5 specs from the assets repo"
-echo "  validate-integration bulk                          # validate everything in unvalidated/"
-echo "  validate-integration status                        # show bucket counts"
+echo "  validate-integration fetch                             # pull specs from the assets repo"
+echo "  validate-integration bulk                             # validate all fetched specs"
+echo "  validate-integration /path/to/your/openapi.json      # single spec"
 echo ""
 echo "Or from Claude Code:"
-echo "  /validate-integration /path/to/spec.json"
+echo "  /validate-integration fetch"
+echo "  /validate-integration bulk"

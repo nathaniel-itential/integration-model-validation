@@ -3,7 +3,7 @@
 *.tmp
 node_modules/
 
-# Managed specs folder — bucket dirs ship in git (via .gitkeep) but the
-# fetched OpenAPI specs themselves are local-only.
-specs/**/*.json
-!specs/**/.gitkeep
+# fetch/bulk output files — written to CWD, not part of the repo.
+validate-paths.json
+validate-report.json
+validate-report.md

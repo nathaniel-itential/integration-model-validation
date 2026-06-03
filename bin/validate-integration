@@ -3,23 +3,12 @@
 #
 # Usage:
 #   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
-#   validate-integration fetch [<N> | --all] [--branch <name>]
-#   validate-integration bulk  [--rerun | --no-rerun] [--cleanup] [--group <name>] [--json]
-#   validate-integration status [--json]
-#
-# Subcommands:
-#   (none)   Validate a single spec by path (current behavior). If the spec
-#            lives under the managed specs/ tree, it's moved into the matching
-#            bucket (validated/partial/failed) after the run, and you'll be
-#            prompted before re-running a spec that's already in validated/.
-#   fetch    Pull OpenAPI specs from the assets repo into specs/unvalidated/.
-#            Specs already present in any bucket are skipped.
-#   bulk     Validate every spec under specs/unvalidated/. Prompts once before
-#            including already-validated specs (override with --rerun/--no-rerun).
-#   status   Print a summary of specs per bucket.
+#   validate-integration fetch [--branch <name>]
+#   validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
+#   validate-integration platform-reset
 #
 # Exit codes:
-#   0 = PASS (single) or no failures (bulk/fetch/status)
+#   0 = PASS (single) or no failures (bulk/fetch)
 #   1 = at least one spec FAILed or was PARTIAL
 #   2 = setup error (bad args, missing config, login failed, dev stack unreachable)
 
@@ -27,20 +16,18 @@ set -uo pipefail
 
 CONFIG_DIR="$HOME/.claude/skills/validate-integration"
 CONFIG_FILE="$CONFIG_DIR/config.json"
-DEFAULT_PROJECT_ROOT="$CONFIG_DIR/specs"
+PATHS_FILE="$PWD/validate-paths.json"
+REPORT_FILE="$PWD/validate-report.json"
 DEFAULT_ASSETS_CACHE="$HOME/.cache/itential-assets"
 DEFAULT_ASSETS_REPO_URL="https://github.com/itential/assets.git"
 DEFAULT_ASSETS_BRANCH="add-openapi-specs"
-BUCKETS=(unvalidated validated partial failed)
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  validate-integration <spec.json> [--cleanup] [--group <name>] [--json] [--force]
-  validate-integration fetch [<N> | --all] [--branch <name>]
-  validate-integration bulk  [--rerun | --no-rerun] [--no-cleanup] [--throttle <s>] [--group <name>] [--json]
-  validate-integration status [--json]
-  validate-integration clear [--all | --unvalidated | --validated | --partial | --failed] [--yes]
+  validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
+  validate-integration fetch [--branch <name>]
+  validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
   validate-integration platform-reset
 
 Run 'validate-integration help' for examples and flag details.
@@ -52,91 +39,40 @@ print_help() {
   cat <<'EOF'
 USAGE
   validate-integration <spec.json> [flags]    # validate one spec
-  validate-integration fetch <N|--all>         # pull specs from the assets repo
-  validate-integration bulk [flags]            # validate every spec in unvalidated/
-  validate-integration status                  # show bucket counts + listing
-  validate-integration clear <bucket-flags>    # delete local specs from buckets
-  validate-integration platform-reset          # restart the platform container (clears in-memory bloat)
+  validate-integration fetch [--branch <name>] # pull specs from the assets repo
+  validate-integration bulk [flags]            # validate every spec from fetch
+  validate-integration platform-reset          # restart the platform container
   validate-integration help                    # this screen
-
-EXAMPLES
-  # Validate a single spec by path (Downloads shortcuts work too)
-  validate-integration ~/Downloads/foo.json
-  validate-integration foo.json                  # resolves under download_path
-
-  # Pull and bulk-test from the assets repo
-  validate-integration fetch 10                  # pull 10 unvalidated specs
-  validate-integration fetch --all               # pull every spec not yet local
-  validate-integration bulk                      # validate them all
-  validate-integration bulk --rerun              # also re-run validated/ specs
-
-  # Inspect state
-  validate-integration status                    # human-readable
-  validate-integration status --json             # machine-readable
-
-  # Drill into a specific failure after a bulk run
-  validate-integration specs/failed/Akamai/akamai_api.json
-
-  # Wipe local buckets (does not touch the IAP stack)
-  validate-integration clear --all               # empty every bucket
-  validate-integration clear --failed --partial  # empty specific buckets
-  validate-integration clear --all --yes         # skip confirmation
 
 FLAGS
   Single-spec mode:
     --cleanup         Delete the imported model + instance after the run
     --group <name>    Grant the role to this group (default: from config)
     --json            Emit JSON instead of the formatted report
-    --force           Skip the "spec already in validated/partial — rerun?" prompt
 
   fetch:
-    <N>               Number of specs to pull (must be a non-negative integer)
-    --all             Pull every spec not already in any bucket
     --branch <name>   Use a non-default branch of the assets repo
 
   bulk:
-    --rerun           Include specs already in validated/ (no prompt)
-    --no-rerun        Skip already-validated specs (no prompt)
     --no-cleanup      Keep imported models + instances after each spec
-                      (cleanup is ON by default in bulk — many models bog
-                      the platform down)
+                      (cleanup is ON by default in bulk)
     --throttle <s>    Seconds to pause between specs (default: 0). Bump
                       to 1–3 if the platform starts returning HTTP 404 or
                       000 on import mid-run.
     --group <name>    Group override for all specs in the batch
-    --json            Emit JSON instead of the per-spec report
 
-    Bulk also runs a quick platform health check between specs and aborts
-    the run cleanly if the dev stack stops responding, rather than marking
-    every remaining spec as FAIL.
-
-  status:
-    --json            Emit JSON instead of the formatted listing
-
-  clear:
-    --all             Empty every bucket
-    --unvalidated     Empty unvalidated/
-    --validated       Empty validated/
-    --partial         Empty partial/
-    --failed          Empty failed/
-    --yes, -y         Skip the confirmation prompt (required for non-interactive use)
+    Bulk reads paths from validate-paths.json (written by 'fetch') in the current
+    working directory and writes results to validate-report.json in the same directory.
 
   platform-reset:
     (no flags)        Runs 'docker restart <platform_container>' and waits up
                       to 120s for the dev stack to become healthy again.
-                      Clears in-memory leaks that accumulate across many bulk
-                      runs. Mongo and Redis state are NOT touched — only the
-                      platform Node process is recycled.
-                      ONLY use on a local dev stack dedicated to spec
-                      validation. Restarting a stack where someone else is
-                      mid-test will interrupt their work.
 
 STAGES (per spec)
   login           authenticate against the dev stack
   auth-check      verify spec's components.securitySchemes only uses
-                  Itential-supported types (apiKey, http with basic/bearer,
-                  oauth2, mutualTLS, openIdConnect). Fails fast before
-                  touching the platform.
+                  supported types AND that at least one scheme is applied
+                  to operations. Fails fast before touching the platform.
   import          POST the spec; canonical AJV validation
   instance        create a virtual instance from the model
   role-discovery  find the auto-created admin role for the versionId
@@ -145,7 +81,7 @@ STAGES (per spec)
   cleanup         (optional) delete instance + model, verify gone
 
 EXIT CODES
-  0   PASS (single) or no failures (bulk/fetch/status)
+  0   PASS (single) or no failures (bulk/fetch)
   1   at least one spec FAILed or was PARTIAL
   2   setup error (bad args, missing config, login failed, stack unreachable)
 EOF
@@ -161,7 +97,6 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "password": "admin",
   "default_group": "admin_group",
   "download_path": "$HOME/Downloads",
-  "project_root": "$DEFAULT_PROJECT_ROOT",
   "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
   "assets_branch": "$DEFAULT_ASSETS_BRANCH",
   "assets_cache_dir": "$DEFAULT_ASSETS_CACHE",
@@ -177,86 +112,13 @@ USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username || '')")
 PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password || '')")
 DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group || '')")
 DOWNLOAD_PATH=$(node -e "const c=require('$CONFIG_FILE'); console.log((c.download_path||'').replace(/^~/, process.env.HOME))")
-PROJECT_ROOT=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.project_root||'$DEFAULT_PROJECT_ROOT')).replace(/^~/, process.env.HOME))")
 ASSETS_REPO_URL=$(node -e "console.log(require('$CONFIG_FILE').assets_repo_url || '$DEFAULT_ASSETS_REPO_URL')")
 ASSETS_BRANCH=$(node -e "console.log(require('$CONFIG_FILE').assets_branch || '$DEFAULT_ASSETS_BRANCH')")
 ASSETS_CACHE_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_cache_dir||'$DEFAULT_ASSETS_CACHE')).replace(/^~/, process.env.HOME))")
 PLATFORM_CONTAINER=$(node -e "console.log(require('$CONFIG_FILE').platform_container || 'platform')")
 
-ensure_project_dirs() {
-  for b in "${BUCKETS[@]}"; do
-    mkdir -p "$PROJECT_ROOT/$b"
-  done
-}
-
-# Convert an absolute path under $PROJECT_ROOT/<bucket>/ to its bucket-relative
-# canonical form (e.g., Atlassian/Bitbucket/bitbucket_cloud_2.0.json). Echoes
-# nothing if the path isn't under the project root.
-canonical_relpath() {
-  local abs="$1"
-  for b in "${BUCKETS[@]}"; do
-    local prefix="$PROJECT_ROOT/$b/"
-    if [[ "$abs" == "$prefix"* ]]; then
-      echo "${abs#$prefix}"
-      return
-    fi
-  done
-  echo ""
-}
-
-# Find which bucket (if any) currently holds a given canonical relpath.
-find_bucket_for() {
-  local rel="$1"
-  for b in "${BUCKETS[@]}"; do
-    if [ -f "$PROJECT_ROOT/$b/$rel" ]; then
-      echo "$b"
-      return
-    fi
-  done
-  echo ""
-}
-
-# Move a spec file into a target bucket, preserving its relative subpath.
-# Removes empty parent dirs from the old location.
-move_to_bucket() {
-  local src="$1" target_bucket="$2"
-  local rel
-  rel=$(canonical_relpath "$src")
-  [ -z "$rel" ] && return 1
-  local dest="$PROJECT_ROOT/$target_bucket/$rel"
-  mkdir -p "$(dirname "$dest")"
-  if [ "$src" != "$dest" ]; then
-    mv -f "$src" "$dest"
-    # Prune empty source dirs (best-effort)
-    local d
-    d=$(dirname "$src")
-    while [ "$d" != "$PROJECT_ROOT" ] && [ "$d" != "/" ] && [ -d "$d" ] && [ -z "$(ls -A "$d" 2>/dev/null)" ]; do
-      rmdir "$d" 2>/dev/null || break
-      d=$(dirname "$d")
-    done
-  fi
-  echo "$dest"
-}
-
 # Find the auto-created admin role for a given integration-model versionId.
-#
-# The platform's /authorization/roles endpoint:
-#   - caps page size server-side at 100 (regardless of requested ?limit=)
-#   - defaults to sort={name:1} which is UNSTABLE — many docs share the same
-#     name (87 admin roles, 89 get roles, etc.), and MongoDB's sort gives no
-#     ordering guarantee within a group of tied keys, so the same skip=N
-#     query returns different items across calls. We previously worked
-#     around this with dense overlapping windows (step=10/25), which was
-#     slow and not fully reliable.
-#
-# Fix: pass ?sort=_id&order=1. _id is unique per role so there are no ties,
-# and the helper (see /api/routes/Authorization/helpers/roles.js in the IAP
-# source) honors arbitrary sort fields. This makes pagination deterministic
-# and lets us use step=100 (no overlap) safely.
-#
-# We still retry a couple of times with brief sleeps in case the role hasn't
-# yet been written by the platform's worker — role creation is async after
-# the import call returns.
+# Sorts using Mongo's _id so pages are stable if roles are added mid-scan.
 _scan_for_admin_role() {
   local local_token="$1" version="$2"
   local skip page found_id got empty_pages=0
@@ -276,13 +138,14 @@ try {
     got=$(echo "$page" | node -e "try {const r=JSON.parse(require('fs').readFileSync(0,'utf-8'));process.stdout.write(String((r.results||[]).length));}catch(e){process.stdout.write('0');}")
     if [ "$got" -eq 0 ]; then
       empty_pages=$((empty_pages + 1))
-      [ "$empty_pages" -ge 2 ] && break  # one empty page suffices, but allow a margin
+      [ "$empty_pages" -ge 2 ] && break
     else
       empty_pages=0
     fi
   done
   return 1
 }
+
 
 find_admin_role_id() {
   local local_token="$1" version="$2"
@@ -295,37 +158,19 @@ find_admin_role_id() {
     fi
     [ "$attempt" -lt 3 ] && sleep 1
   done
-  echo ""
   return 1
 }
 
 # DELETEs the instance + integration model, then verifies the model is gone
 # by polling the single-model endpoint until it stops returning 200.
 #
-# versionId is a unique identifier (title:version, enforced unique by the
-# platform), so we can look up exactly one document by encoding it into the
-# URL. The endpoint returns HTTP 200 with the model body when present, and
-# HTTP 500 with body "Cannot find integration model ..." when absent — so
-# any non-200 response means the platform no longer has it. Much cheaper
-# than the previous approach of fetching a 100-doc page and searching it.
-#
-# We still poll briefly because DELETE returns 2xx before the worker reload
-# completes; in practice the first GET after DELETE is usually already
-# non-200, but we allow up to ~1.5s for slow unloads.
-#
-# Note: the auto-created roles for this versionId are NOT removed by the
-# model DELETE — only the model document goes away. The direct role-DELETE
-# endpoint refuses auto-created roles ("Cannot delete a non-custom role"),
-# so no API path retires them. They accumulate across runs until the dev
-# stack's MongoDB state is wiped. Re-importing the same versionId is safe
-# — existing roles are reused (upserted) rather than duplicated.
-#
 # Returns 0 if the model is verifiably gone, 1 if it's still present after
-# the timeout.
+# the timeout (1.5s).
 cleanup_one() {
   local local_token="$1" inst="$2" version="$3"
   # Delete instance first — instances reference the model and block its deletion.
   curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$inst" -H "Cookie: token=$local_token"
+  sleep 0.5
   local enc
   enc=$(node -e "console.log(encodeURIComponent(process.argv[1]))" -- "$version")
   curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$local_token"
@@ -340,7 +185,7 @@ cleanup_one() {
 
 # --------- per-spec pipeline ---------
 # Inputs: $1 = absolute spec path, $2 = token
-# Optional env: GROUP_NAME, CLEANUP, JSON_OUT, QUIET (=true to suppress full report)
+# Optional env: GROUP_NAME, CLEANUP, JSON_OUT
 # Sets globals: SPEC_VERDICT, SPEC_VERSION_ID, SPEC_EXPECTED_OPS, SPEC_ACTUAL_METHODS,
 #               SPEC_STAGES_JSON, SPEC_FAIL_STAGE, SPEC_FAIL_DETAIL
 validate_one_spec() {
@@ -350,11 +195,9 @@ validate_one_spec() {
   SPEC_FAIL_DETAIL=""
   SPEC_ACTUAL_METHODS=""
   local stages_json="[]"
-  # Flips true once the model is imported on the platform. Any post-import
-  # failure path uses this to know it needs to clean up before returning.
   local imported=false
-
   local record_local
+
   record_local() {
     local name="$1" ok="$2" detail="$3"
     stages_json=$(node -e "
@@ -373,7 +216,7 @@ console.log(JSON.stringify(s));
     SPEC_STAGES_JSON='[{"name":"parse","ok":false,"detail":"could not parse spec JSON"}]'
     return 1
   fi
-  version=$(node -e "console.log(require('$spec_path').info.version)")
+  version=$(node -e "console.log(require('$spec_path').info.version||'')")
   SPEC_VERSION_ID="$title:$version"
   SPEC_EXPECTED_OPS=$(node -e "
 const s=require('$spec_path');
@@ -385,14 +228,10 @@ console.log(n);
   local instance_name
   instance_name=$(echo "$title" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
 
-  # Step 0.5: auth pre-flight
+  # Step 0.5: auth check
   # Verify the spec's components.securitySchemes only uses types Itential
-  # supports. Per the platform docs (admin-essentials/integrations/auth/
-  # security-schemes), supported types are: apiKey, http (with scheme=basic
-  # or bearer), oauth2, mutualTLS, openIdConnect. The platform also only
-  # honors the FIRST scheme listed, so we surface a note when multiple are
-  # defined. Failing here saves a wasted import for clearly-incompatible
-  # specs.
+  # supports (apiKey, http with basic/bearer, oauth2, mutualTLS, openIdConnect)
+  # AND that at least one supported scheme is applied to operations.
   local auth_result
   auth_result=$(node -e "
 const s=require('$spec_path');
@@ -403,6 +242,7 @@ const SUPPORTED=new Set(['apikey','http','oauth2','mutualtls','openidconnect']);
 const HTTP_OK=new Set(['basic','bearer']);
 const bad=[];
 const summary=[];
+const supported=[];
 for (const [name, sc] of entries) {
   const t=(sc.type||'').toLowerCase();
   if (!SUPPORTED.has(t)) {
@@ -416,13 +256,27 @@ for (const [name, sc] of entries) {
       continue;
     }
     summary.push(\`\${name}:http/\${sub}\`);
+    supported.push({name, display:\`http/\${sub}\`});
   } else {
     summary.push(\`\${name}:\${sc.type}\`);
+    supported.push({name, display:sc.type});
   }
 }
 if (bad.length) { console.log('FAIL|'+bad.join('; ')); process.exit(0); }
-const note = entries.length>1 ? \` (note: \${entries.length} schemes defined — platform honors only the first)\` : '';
-console.log('OK|'+summary.join(', ')+note);
+const applied=new Set();
+for (const req of (s.security||[])) for (const k of Object.keys(req)) applied.add(k);
+const verbs=new Set(['get','post','put','patch','delete','head','options']);
+for (const item of Object.values(s.paths||{})) {
+  for (const [v,op] of Object.entries(item)) {
+    if (!verbs.has(v)||!op||typeof op!=='object') continue;
+    for (const req of (op.security||[])) for (const k of Object.keys(req)) applied.add(k);
+  }
+}
+const unapplied=supported.filter(({name})=>!applied.has(name));
+const parts=[summary.join(', ')];
+for (const {name,display} of unapplied) parts.push(\`auth defined but unapplied: '\${name}' (\${display})\`);
+const status=unapplied.length===supported.length&&supported.length>0 ? 'FAIL' : 'OK';
+console.log(status+'|'+parts.join('; '));
 ")
   local auth_status="${auth_result%%|*}" auth_detail="${auth_result#*|}"
   if [ "$auth_status" = "FAIL" ]; then
@@ -435,7 +289,7 @@ console.log('OK|'+summary.join(', ')+note);
   fi
   record_local "auth-check" "true" "$auth_detail"
 
-  # Step 1: import
+  # Step 1: import into platform
   local tmp_body
   tmp_body=$(mktemp -t iap-import-body.XXXXXX)
   node -e "require('fs').writeFileSync('$tmp_body', JSON.stringify({model: require('$spec_path')}))"
@@ -473,19 +327,22 @@ try {
     return 1
   fi
 
-  # Step 2: instance
-  local instance_full instance_code instance_body
+  # Step 2: create instance
+  local instance_req_file instance_full instance_code instance_body
+  instance_req_file=$(mktemp -t iap-instance-body.XXXXXX)
+  node -e "
+const name=process.argv[1], vid=process.argv[2];
+process.stdout.write(JSON.stringify({properties:{name,type:'Adapter',properties:{id:name,type:vid},virtual:true}}));
+" -- "$instance_name" "$SPEC_VERSION_ID" > "$instance_req_file"
   instance_full=$(curl -s -w "\nHTTPCODE:%{http_code}" -X POST "$IAP_URL/integrations" \
     -H "Cookie: token=$token" \
     -H "Content-Type: application/json" \
-    -d "{\"properties\": {\"name\": \"$instance_name\", \"type\": \"Adapter\", \"properties\": {\"id\": \"$instance_name\", \"type\": \"$SPEC_VERSION_ID\"}, \"virtual\": true}}")
+    --data @"$instance_req_file")
   instance_code=$(echo "$instance_full" | tail -n1 | sed 's/HTTPCODE://')
   instance_body=$(echo "$instance_full" | sed '$d')
+  rm -f "$instance_req_file"
 
-  # The platform doesn't always honor the name we POST — for some specs it
-  # returns or reuses an existing instance with a different name. Parse the
-  # response and overwrite instance_name with whatever the platform actually
-  # stored, otherwise cleanup will try to DELETE a name that doesn't exist.
+  # update name with name from POST to ensure proper deletion
   if [ "$instance_code" -ge 200 ] && [ "$instance_code" -lt 300 ]; then
     local actual_name
     actual_name=$(echo "$instance_body" | node -e "
@@ -499,7 +356,7 @@ try {
       instance_name="$actual_name"
     fi
     record_local "instance" "true" "HTTP $instance_code (created, name=$instance_name)"
-  elif echo "$instance_body" | grep -qi "already exists\|duplicate"; then
+  elif echo "$instance_body" | grep -Eqi "already exists|duplicate"; then
     record_local "instance" "true" "HTTP $instance_code (already exists)"
   else
     record_local "instance" "false" "HTTP $instance_code: ${instance_body:0:120}"
@@ -510,14 +367,14 @@ try {
       if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
         record_local "cleanup" "true" "deleted model (on instance failure)"
       else
-        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+        record_local "cleanup" "false" "DELETE issued but model still present after 1.5s"
       fi
     fi
     SPEC_STAGES_JSON="$stages_json"
     return 1
   fi
 
-  # Step 3: role discovery (paginated — platform caps page size at 100)
+  # Step 3: role discovery
   local role_id
   role_id=$(find_admin_role_id "$token" "$SPEC_VERSION_ID")
   if [ -z "$role_id" ]; then
@@ -529,7 +386,7 @@ try {
       if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
         record_local "cleanup" "true" "deleted model + instance (on role-discovery failure)"
       else
-        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+        record_local "cleanup" "false" "DELETE issued but model still present after 1.5s"
       fi
     fi
     SPEC_STAGES_JSON="$stages_json"
@@ -559,7 +416,7 @@ console.log((r.results||[]).map(g=>g.name).join(', '));
       if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
         record_local "cleanup" "true" "deleted model + instance (on authz failure)"
       else
-        record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+        record_local "cleanup" "false" "DELETE issued but model still present after 1.5s"
       fi
     fi
     SPEC_STAGES_JSON="$stages_json"
@@ -595,7 +452,7 @@ console.log(JSON.stringify(cur));
         if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
           record_local "cleanup" "true" "deleted model + instance (on authz patch failure)"
         else
-          record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+          record_local "cleanup" "false" "DELETE issued but model still present after 1.5s"
         fi
       fi
       SPEC_STAGES_JSON="$stages_json"
@@ -625,14 +482,12 @@ console.log((role.allowedMethods||[]).length);
     SPEC_FAIL_DETAIL="$SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS"
   fi
 
-  # Step 6: optional cleanup (verified — polls until the model is actually
-  # gone before returning, so the next spec doesn't race the platform's
-  # async worker reload)
+  # Step 6: optional cleanup
   if [ "${CLEANUP:-false}" = "true" ]; then
     if cleanup_one "$token" "$instance_name" "$SPEC_VERSION_ID"; then
       record_local "cleanup" "true" "deleted instance + model (verified)"
     else
-      record_local "cleanup" "false" "DELETE issued but model still present after 3s"
+      record_local "cleanup" "false" "DELETE issued but model still present after 1.5s"
     fi
   fi
 
@@ -642,7 +497,6 @@ console.log((role.allowedMethods||[]).length);
 
 # --------- report helpers ---------
 emit_full_report() {
-  # Args: spec_path, login_stage_json
   local spec_path="$1" login_json="$2"
   local stages
   stages=$(node -e "
@@ -679,7 +533,6 @@ for (const x of s) {
   fi
 }
 
-# Returns the verdict mark (✓/~/✗) for a one-line bulk row
 verdict_mark() {
   case "$1" in
     PASS)    echo "✓" ;;
@@ -688,13 +541,82 @@ verdict_mark() {
   esac
 }
 
-# --------- login (shared by all run modes) ---------
+write_report_md() {
+  local md_file="${REPORT_FILE%.json}.md"
+  node -e "
+const report=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8'));
+const s=report.summary;
+const SKIP=new Set(['assets','itential-assets']);
+function label(spec,vid){
+  const parts=(spec||'').split('/');
+  const idx=parts.lastIndexOf('OpenAPIs');
+  const file=parts[parts.length-1]||'—';
+  let product='—';
+  if(idx>0){
+    const vp=[];
+    for(let i=idx-1;i>=0&&vp.length<2;i--){
+      if(!SKIP.has(parts[i]))vp.unshift(parts[i]);
+      else break;
+    }
+    product=vp.join(' / ')||parts[idx-1];
+  }
+  const title=vid?vid.split(':').slice(0,-1).join(':'):file;
+  return {product,title};
+}
+function esc(s){return String(s).replace(/\|/g,'\\|');}
+const lines=[];
+lines.push('# Integration Validation Report');
+lines.push('');
+lines.push('**Date:** '+report.timestamp+'  ');
+if(report.aborted){
+  lines.push('**Status:** Aborted  ');
+  lines.push('**Progress:** '+s.validated+' of '+s.total+' specs validated  ');
+} else {
+  lines.push('**Status:** Complete  ');
+}
+lines.push('**Results:** '+s.pass+' PASS · '+s.partial+' PARTIAL · '+s.fail+' FAIL');
+lines.push('');
+lines.push('## Results');
+lines.push('');
+lines.push('| Product | Spec | Result |');
+lines.push('|---------|------|--------|');
+for(const r of report.results){
+  const {product,title}=label(r.spec,r.versionId);
+  let result;
+  if(r.verdict==='PASS') result='✓ PASS ('+r.actualMethods+'/'+r.expectedOps+')';
+  else if(r.verdict==='PARTIAL') result='~ PARTIAL ('+r.actualMethods+'/'+r.expectedOps+')';
+  else result='✗ FAIL';
+  lines.push('| '+esc(product)+' | '+esc(title)+' | '+result+' |');
+}
+const failures=report.results.filter(r=>r.verdict!=='PASS');
+if(failures.length>0){
+  lines.push('');
+  lines.push('## Failures');
+  for(const r of failures){
+    const {product,title}=label(r.spec,r.versionId);
+    lines.push('');
+    lines.push('### '+esc(product)+' — '+esc(title));
+    if(r.verdict==='PARTIAL'){
+      lines.push('**Result:** PARTIAL — '+r.actualMethods+' of '+r.expectedOps+' operations callable');
+    } else {
+      lines.push('**Stage:** '+(r.failStage||'—')+'  ');
+      lines.push('**Detail:** '+(r.failDetail||'—'));
+    }
+  }
+}
+lines.push('');
+require('fs').writeFileSync(process.argv[2],lines.join('\n'));
+" -- "$REPORT_FILE" "$md_file"
+  echo "Markdown report written to $md_file"
+}
+
+# --------- login ---------
 do_login() {
   local token sanity
-  token=$(curl -s -X POST "$IAP_URL/login" \
+  token=$(curl -s --max-time 10 -X POST "$IAP_URL/login" \
     -H "Content-Type: application/json" \
     -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}")
-  sanity=$(curl -s -o /dev/null -w "%{http_code}" \
+  sanity=$(curl -s --max-time 10 -o /dev/null -w "%{http_code}" \
     -H "Cookie: token=$token" \
     "$IAP_URL/authorization/accounts?limit=1")
   if [ "$sanity" != "200" ]; then
@@ -707,10 +629,6 @@ do_login() {
   return 0
 }
 
-# Lightweight liveness check against an already-authenticated endpoint.
-# Used between specs in bulk mode so we abort the run cleanly when the
-# platform falls over mid-batch instead of marching through dozens of
-# misleading per-spec failures. Returns 0 on healthy, non-zero otherwise.
 platform_health() {
   local local_token="$1"
   local code
@@ -722,15 +640,14 @@ platform_health() {
 
 # --------- subcommands ---------
 
+#Single validation with a direct path to the json
 cmd_single() {
-  # Parse single-spec args
-  local spec_path="" group_override="" cleanup=false json_out=false force_rerun=false
+  local spec_path="" group_override="" cleanup=false json_out=false
   while [ $# -gt 0 ]; do
     case "$1" in
       --cleanup) cleanup=true; shift ;;
       --group)   group_override="${2:-}"; shift 2 ;;
       --json)    json_out=true; shift ;;
-      --force)   force_rerun=true; shift ;;
       -h|--help) usage ;;
       -*)        echo "Unknown flag: $1" >&2; usage ;;
       *)         if [ -z "$spec_path" ]; then spec_path="$1"; else usage; fi; shift ;;
@@ -738,7 +655,6 @@ cmd_single() {
   done
   [ -n "$spec_path" ] || usage
 
-  # Resolve relative + Downloads-shorthand paths
   if [ ! -f "$spec_path" ] && [ -n "$DOWNLOAD_PATH" ] && [ -f "$DOWNLOAD_PATH/$spec_path" ]; then
     spec_path="$DOWNLOAD_PATH/$spec_path"
   fi
@@ -747,30 +663,11 @@ cmd_single() {
     [ -n "$DOWNLOAD_PATH" ] && echo "  also tried: $DOWNLOAD_PATH/$spec_path" >&2
     exit 2
   fi
-  # absolute path
   spec_path=$(cd "$(dirname "$spec_path")" && pwd)/$(basename "$spec_path")
 
   GROUP_NAME="${group_override:-$DEFAULT_GROUP}"
   CLEANUP="$cleanup"
   JSON_OUT="$json_out"
-
-  # Rerun prompt if spec is in the validated/partial buckets
-  ensure_project_dirs
-  local rel current_bucket
-  rel=$(canonical_relpath "$spec_path")
-  if [ -n "$rel" ]; then
-    current_bucket=$(find_bucket_for "$rel")
-    if { [ "$current_bucket" = "validated" ] || [ "$current_bucket" = "partial" ]; } && [ "$force_rerun" = "false" ]; then
-      if [ -t 0 ]; then
-        echo "This spec is already in '$current_bucket/'. Re-run? [y/N] " >&2
-        read -r yn
-        case "$yn" in [yY]|[yY][eE][sS]) ;; *) echo "Skipped." >&2; exit 0 ;; esac
-      else
-        echo "Spec already in '$current_bucket/'. Pass --force to re-run noninteractively." >&2
-        exit 0
-      fi
-    fi
-  fi
 
   if ! do_login; then
     if $JSON_OUT; then
@@ -795,51 +692,55 @@ console.log(JSON.stringify({
   validate_one_spec "$spec_path" "$LOGIN_TOKEN"
   emit_full_report "$spec_path" "$LOGIN_STAGE_JSON"
 
-  # Sort into bucket if spec lives under project root
-  if [ -n "$rel" ]; then
-    local target
-    case "$SPEC_VERDICT" in
-      PASS)    target="validated" ;;
-      PARTIAL) target="partial" ;;
-      *)       target="failed" ;;
-    esac
-    if [ "$current_bucket" != "$target" ]; then
-      local new_path
-      new_path=$(move_to_bucket "$spec_path" "$target")
-      $JSON_OUT || echo "Moved to: $new_path"
-    fi
-  fi
+  local timestamp pass=0 fail=0 partial=0
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  case "$SPEC_VERDICT" in
+    PASS)    pass=1 ;;
+    PARTIAL) partial=1 ;;
+    *)       fail=1 ;;
+  esac
+  node -e "
+const entry={
+  spec: process.argv[2],
+  versionId: process.argv[3],
+  verdict: process.argv[4],
+  expectedOps: parseInt(process.argv[5]||'0',10),
+  actualMethods: process.argv[6] ? parseInt(process.argv[6],10) : null
+};
+if (process.argv[7]) entry.failStage=process.argv[7];
+if (process.argv[8]) entry.failDetail=process.argv[8];
+console.log(JSON.stringify({
+  timestamp: process.argv[1],
+  aborted: false,
+  summary: { total:1, pass:parseInt(process.argv[9],10), partial:parseInt(process.argv[10],10), fail:parseInt(process.argv[11],10) },
+  results: [entry]
+}, null, 2));
+" -- "$timestamp" "$spec_path" "$SPEC_VERSION_ID" "$SPEC_VERDICT" \
+  "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "${SPEC_FAIL_STAGE:-}" "${SPEC_FAIL_DETAIL:-}" \
+  "$pass" "$partial" "$fail" > "$REPORT_FILE"
+  echo ""
+  echo "Report written to $REPORT_FILE"
+  write_report_md
 
   [ "$SPEC_VERDICT" = "PASS" ] && exit 0 || exit 1
 }
 
+#Fetch command, pulls spec paths from local git repo and branch specified in config
+#Puts paths into validate-paths to be validated by the validate-bulk command
 cmd_fetch() {
-  local count="" fetch_all=false branch_override=""
+  local branch_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --all)    fetch_all=true; shift ;;
       --branch) branch_override="${2:-}"; shift 2 ;;
       -h|--help) usage ;;
-      -*)       echo "Unknown flag: $1" >&2; usage ;;
-      *)        if [ -z "$count" ]; then count="$1"; else usage; fi; shift ;;
+      -*) echo "Unknown flag: $1" >&2; usage ;;
+      *)  echo "Unknown arg: $1" >&2; usage ;;
     esac
   done
-  if ! $fetch_all && [ -z "$count" ]; then
-    echo "fetch: must specify a count (e.g., 'fetch 5') or --all" >&2
-    exit 2
-  fi
-  if ! $fetch_all; then
-    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
-      echo "fetch: count must be a non-negative integer, got: $count" >&2
-      exit 2
-    fi
-  fi
   local branch="${branch_override:-$ASSETS_BRANCH}"
 
-  ensure_project_dirs
   mkdir -p "$(dirname "$ASSETS_CACHE_DIR")"
 
-  # Clone or update the cache
   if [ -d "$ASSETS_CACHE_DIR/.git" ]; then
     echo "Updating asset cache at $ASSETS_CACHE_DIR (branch $branch)..." >&2
     git -C "$ASSETS_CACHE_DIR" fetch --depth 1 origin "$branch" >/dev/null 2>&1 || {
@@ -855,7 +756,6 @@ cmd_fetch() {
     }
   fi
 
-  # Discover specs in the cache (convention: */OpenAPIs/*.json)
   local search_root
   if [ -d "$ASSETS_CACHE_DIR/assets" ]; then
     search_root="$ASSETS_CACHE_DIR/assets"
@@ -863,235 +763,171 @@ cmd_fetch() {
     search_root="$ASSETS_CACHE_DIR"
   fi
 
-  # Build candidate list: each line is "<canonical-rel-path>\t<abs-source-path>"
-  local candidates
-  candidates=$(find "$search_root" -type f -name '*.json' -path '*/OpenAPIs/*' 2>/dev/null | while read -r abs; do
-    local rel="${abs#$search_root/}"
-    # Strip the OpenAPIs/ middle dir: Vendor/Product/OpenAPIs/foo.json -> Vendor/Product/foo.json
-    local canonical
-    canonical=$(echo "$rel" | sed 's|/OpenAPIs/|/|')
-    printf '%s\t%s\n' "$canonical" "$abs"
-  done | sort)
+  local paths_json
+  paths_json=$(find "$search_root" -type f -name '*.json' -path '*/OpenAPIs/*' 2>/dev/null | sort | node -e "
+const lines=require('fs').readFileSync(0,'utf-8').trim().split('\n').filter(Boolean);
+console.log(JSON.stringify(lines, null, 2));
+")
 
-  if [ -z "$candidates" ]; then
-    echo "No specs found under $search_root/*/OpenAPIs/" >&2
-    exit 2
-  fi
+  local count
+  count=$(echo "$paths_json" | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf-8')).length)")
 
-  # Filter out specs already present in any bucket
-  local pending=""
-  while IFS=$'\t' read -r canonical abs; do
-    [ -z "$canonical" ] && continue
-    if [ -z "$(find_bucket_for "$canonical")" ]; then
-      pending+="$canonical"$'\t'"$abs"$'\n'
-    fi
-  done <<< "$candidates"
-
-  local total_candidates available_count
-  total_candidates=$(echo "$candidates" | grep -c $'\t' || true)
-  available_count=$(printf '%s' "$pending" | grep -c $'\t' || true)
-
-  if [ "$available_count" -eq 0 ]; then
-    echo "Up to date: all $total_candidates specs in the repo are already in your project folder." >&2
-    exit 0
-  fi
-
-  # Take N (or all)
-  local take_n
-  if $fetch_all; then
-    take_n="$available_count"
-  else
-    take_n="$count"
-    if [ "$take_n" -gt "$available_count" ]; then take_n="$available_count"; fi
-  fi
-
-  local copied=0
-  while IFS=$'\t' read -r canonical abs; do
-    [ -z "$canonical" ] && continue
-    [ "$copied" -ge "$take_n" ] && break
-    local dest="$PROJECT_ROOT/unvalidated/$canonical"
-    mkdir -p "$(dirname "$dest")"
-    cp "$abs" "$dest"
-    copied=$((copied + 1))
-    echo "  + $canonical"
-  done <<< "$pending"
-
-  echo ""
-  echo "Fetched $copied spec(s) into $PROJECT_ROOT/unvalidated/."
-  local skipped=$((available_count - copied))
-  if [ "$skipped" -gt 0 ]; then
-    echo "$skipped additional unvalidated spec(s) available in the repo; run 'fetch --all' to grab everything."
-  fi
+  echo "$paths_json" > "$PATHS_FILE"
+  echo "Found $count spec(s). Paths written to $PATHS_FILE."
 }
 
+#Bulk validation, pulls from validate-paths.json populated by the fetch request
 cmd_bulk() {
-  # Bulk defaults to cleanup=true. Many imported models drag the platform down
-  # (workers reload all integration models on every change), so the batch
-  # tears each one down as it finishes. Pass --no-cleanup to keep them.
-  #
-  # --throttle <seconds> inserts a pause between specs. Default 0 (no pause);
-  # bump to 1–3s if you start seeing import HTTP 404/000 mid-run, which means
-  # the platform's workers aren't keeping up with the reload churn.
-  local rerun_mode="prompt" cleanup=true json_out=false group_override="" throttle="0"
+  # Bulk defaults to cleanup=true
+  local cleanup=true group_override="" throttle="0"
   while [ $# -gt 0 ]; do
     case "$1" in
-      --rerun)      rerun_mode="yes"; shift ;;
-      --no-rerun)   rerun_mode="no"; shift ;;
-      --cleanup)    cleanup=true; shift ;;
       --no-cleanup) cleanup=false; shift ;;
+      --cleanup)    cleanup=true; shift ;;
       --throttle)   throttle="${2:-1}"; shift 2 ;;
-      --group)    group_override="${2:-}"; shift 2 ;;
-      --json)     json_out=true; shift ;;
-      -h|--help)  usage ;;
-      *)          echo "Unknown bulk arg: $1" >&2; usage ;;
+      --group)      group_override="${2:-}"; shift 2 ;;
+      -h|--help)    usage ;;
+      *)            echo "Unknown bulk arg: $1" >&2; usage ;;
     esac
   done
   GROUP_NAME="${group_override:-$DEFAULT_GROUP}"
   CLEANUP="$cleanup"
-  JSON_OUT="$json_out"
 
-  ensure_project_dirs
-
-  # Collect candidate spec paths
-  local unvalidated_list validated_list partial_list failed_list
-  unvalidated_list=$(find "$PROJECT_ROOT/unvalidated" -type f -name '*.json' 2>/dev/null | sort)
-  validated_list=$(find "$PROJECT_ROOT/validated" -type f -name '*.json' 2>/dev/null | sort)
-  partial_list=$(find "$PROJECT_ROOT/partial" -type f -name '*.json' 2>/dev/null | sort)
-  failed_list=$(find "$PROJECT_ROOT/failed" -type f -name '*.json' 2>/dev/null | sort)
-
-  local n_unvalidated n_validated
-  n_unvalidated=$(printf '%s' "$unvalidated_list" | grep -c . || true)
-  n_validated=$(printf '%s' "$validated_list" | grep -c . || true)
-
-  if [ "$n_unvalidated" -eq 0 ] && [ "$n_validated" -eq 0 ]; then
-    echo "No specs in $PROJECT_ROOT. Run 'validate-integration fetch <N>' first." >&2
-    exit 0
+  if [ ! -f "$PATHS_FILE" ]; then
+    echo "No paths file found at $PATHS_FILE. Run 'validate-integration fetch' first." >&2
+    exit 2
   fi
 
-  # Decide whether to include validated/ specs in this run
-  local include_validated=false
-  if [ "$n_validated" -gt 0 ]; then
-    case "$rerun_mode" in
-      yes) include_validated=true ;;
-      no)  include_validated=false ;;
-      prompt)
-        if [ -t 0 ]; then
-          echo "$n_validated spec(s) already in validated/. Re-run them too? [y/N] " >&2
-          read -r yn
-          case "$yn" in [yY]|[yY][eE][sS]) include_validated=true ;; esac
-        else
-          include_validated=false
-        fi
-        ;;
-    esac
-  fi
-
-  local run_list="$unvalidated_list"
-  if $include_validated; then
-    run_list+=$'\n'"$validated_list"
-  fi
-
+  local paths_array
+  paths_array=$(cat "$PATHS_FILE")
   local n_total
-  n_total=$(printf '%s' "$run_list" | grep -c . || true)
+  n_total=$(echo "$paths_array" | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf-8')).length)")
+
   if [ "$n_total" -eq 0 ]; then
-    echo "Nothing to validate." >&2
+    echo "No specs in paths file." >&2
     exit 0
   fi
 
-  # Login once
   if ! do_login; then
     echo "Login failed. Check IAP URL/credentials in $CONFIG_FILE." >&2
     exit 2
   fi
 
-  $JSON_OUT || echo "Running $n_total spec(s) against $IAP_URL..."
-  $JSON_OUT || echo ""
+  echo "Running $n_total spec(s) against $IAP_URL..."
+  echo ""
 
   local pass_count=0 partial_count=0 fail_count=0
   local results_json="[]"
   local iter=0
+  local mark="" summary="" label=""
 
   while IFS= read -r spec_path; do
     [ -z "$spec_path" ] && continue
-    # Between specs (not before the first): throttle, then health-check.
     if [ "$iter" -gt 0 ]; then
       sleep "$throttle"
       if ! platform_health "$LOGIN_TOKEN"; then
-        if ! $JSON_OUT; then
-          echo ""
-          echo "=== Bulk aborted ==="
-          echo "Platform health check failed before next spec (sanity ping != HTTP 200)."
-          echo "Progress so far:  PASS=$pass_count PARTIAL=$partial_count FAIL=$fail_count"
-          echo "Remaining:        $((n_total - iter)) spec(s) still in unvalidated/"
-          echo ""
-          echo "Try:   validate-integration platform-reset"
-          echo "Then:  validate-integration bulk"
-          echo ""
-          echo "platform-reset restarts the platform's Node process to clear leaked"
-          echo "in-memory state. Your mongo data and other configuration are preserved."
-        fi
+        echo ""
+        echo "=== Bulk aborted ==="
+        echo "Platform health check failed before next spec (sanity ping != HTTP 200)."
+        echo "Progress so far:  PASS=$pass_count PARTIAL=$partial_count FAIL=$fail_count"
+        echo ""
+        echo "Try:   validate-integration platform-reset"
+        echo "Then:  validate-integration bulk"
+        local aborted_ts aborted_done
+        aborted_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+        aborted_done=$((pass_count + partial_count + fail_count))
+        node -e "
+console.log(JSON.stringify({
+  timestamp: process.argv[1],
+  aborted: true,
+  summary: {
+    total:     parseInt(process.argv[2],10),
+    validated: parseInt(process.argv[3],10),
+    pass:      parseInt(process.argv[4],10),
+    partial:   parseInt(process.argv[5],10),
+    fail:      parseInt(process.argv[6],10)
+  },
+  results: JSON.parse(process.argv[7])
+}, null, 2));
+" -- "$aborted_ts" "$n_total" "$aborted_done" "$pass_count" "$partial_count" "$fail_count" "$results_json" > "$REPORT_FILE"
+        echo "Partial report written to $REPORT_FILE"
+        write_report_md
         exit 2
       fi
     fi
     iter=$((iter + 1))
+
     validate_one_spec "$spec_path" "$LOGIN_TOKEN"
-    local rel target
-    rel=$(canonical_relpath "$spec_path")
+
     case "$SPEC_VERDICT" in
-      PASS)    target="validated"; pass_count=$((pass_count+1)) ;;
-      PARTIAL) target="partial";   partial_count=$((partial_count+1)) ;;
-      *)       target="failed";    fail_count=$((fail_count+1)) ;;
+      PASS)    pass_count=$((pass_count+1)) ;;
+      PARTIAL) partial_count=$((partial_count+1)) ;;
+      *)       fail_count=$((fail_count+1)) ;;
     esac
-    local moved="$spec_path"
-    if [ -n "$rel" ]; then
-      moved=$(move_to_bucket "$spec_path" "$target")
-    fi
-    local mark
+
     mark=$(verdict_mark "$SPEC_VERDICT")
-    local summary
     case "$SPEC_VERDICT" in
       PASS)    summary="PASS ($SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS)" ;;
       PARTIAL) summary="PARTIAL ($SPEC_ACTUAL_METHODS/$SPEC_EXPECTED_OPS)" ;;
       *)       summary="FAIL @${SPEC_FAIL_STAGE}: ${SPEC_FAIL_DETAIL}" ;;
     esac
-    if ! $JSON_OUT; then
-      printf '  [%s] %-50s %s\n' "$mark" "${rel:-$(basename "$spec_path")}" "$summary"
-    fi
+
+    label=$(echo "$spec_path" | node -e "
+const p=require('fs').readFileSync(0,'utf-8').trim();
+const parts=p.split('/');
+const idx=parts.lastIndexOf('OpenAPIs');
+if(idx>=1) process.stdout.write(parts.slice(idx-1).join('/'));
+else process.stdout.write(parts.slice(-2).join('/'));
+")
+    printf '  [%s] %-50s %s\n' "$mark" "$label" "$summary"
+
     results_json=$(node -e "
 const arr=JSON.parse(process.argv[1]);
-arr.push({
+const entry={
   spec: process.argv[2],
-  finalPath: process.argv[3],
-  versionId: process.argv[4],
-  verdict: process.argv[5],
-  expectedOps: parseInt(process.argv[6]||'0',10),
-  actualMethods: process.argv[7] ? parseInt(process.argv[7],10) : null,
-  failStage: process.argv[8] || null,
-  failDetail: process.argv[9] || null,
-  stages: JSON.parse(process.argv[10])
-});
+  versionId: process.argv[3],
+  verdict: process.argv[4],
+  expectedOps: parseInt(process.argv[5]||'0',10),
+  actualMethods: process.argv[6] ? parseInt(process.argv[6],10) : null
+};
+if (process.argv[7]) entry.failStage=process.argv[7];
+if (process.argv[8]) entry.failDetail=process.argv[8];
+arr.push(entry);
 console.log(JSON.stringify(arr));
-" -- "$results_json" "$spec_path" "$moved" "$SPEC_VERSION_ID" "$SPEC_VERDICT" "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "${SPEC_FAIL_STAGE:-}" "${SPEC_FAIL_DETAIL:-}" "$SPEC_STAGES_JSON")
-  done <<< "$run_list"
+" -- "$results_json" "$spec_path" "$SPEC_VERSION_ID" "$SPEC_VERDICT" \
+  "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "${SPEC_FAIL_STAGE:-}" "${SPEC_FAIL_DETAIL:-}")
 
-  if $JSON_OUT; then
-    node -e "
+  done < <(echo "$paths_array" | node -e "
+const paths=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+console.log(paths.join('\n'));
+")
+
+  echo ""
+  echo "=== Bulk Summary ==="
+  echo "Total:    $n_total"
+  echo "PASS:     $pass_count"
+  echo "PARTIAL:  $partial_count"
+  echo "FAIL:     $fail_count"
+
+  local timestamp
+  timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  node -e "
 console.log(JSON.stringify({
-  total: parseInt(process.argv[1],10),
-  pass: parseInt(process.argv[2],10),
-  partial: parseInt(process.argv[3],10),
-  fail: parseInt(process.argv[4],10),
-  results: JSON.parse(process.argv[5])
+  timestamp: process.argv[1],
+  aborted: false,
+  summary: {
+    total:   parseInt(process.argv[2],10),
+    pass:    parseInt(process.argv[3],10),
+    partial: parseInt(process.argv[4],10),
+    fail:    parseInt(process.argv[5],10)
+  },
+  results: JSON.parse(process.argv[6])
 }, null, 2));
-" -- "$n_total" "$pass_count" "$partial_count" "$fail_count" "$results_json"
-  else
-    echo ""
-    echo "=== Bulk Summary ==="
-    echo "Total:    $n_total"
-    echo "PASS:     $pass_count  (-> validated/)"
-    echo "PARTIAL:  $partial_count  (-> partial/)"
-    echo "FAIL:     $fail_count  (-> failed/)"
-  fi
+" -- "$timestamp" "$n_total" "$pass_count" "$partial_count" "$fail_count" "$results_json" > "$REPORT_FILE"
+
+  echo ""
+  echo "Report written to $REPORT_FILE"
+  write_report_md
 
   if [ "$fail_count" -gt 0 ] || [ "$partial_count" -gt 0 ]; then
     exit 1
@@ -1099,133 +935,20 @@ console.log(JSON.stringify({
   exit 0
 }
 
-cmd_status() {
-  local json_out=false
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --json) json_out=true; shift ;;
-      -h|--help) usage ;;
-      *) echo "Unknown status arg: $1" >&2; usage ;;
-    esac
-  done
-  ensure_project_dirs
-  local counts="{}"
-  for b in "${BUCKETS[@]}"; do
-    local n
-    n=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
-    counts=$(node -e "const c=$counts; c['$b']=parseInt('$n',10); console.log(JSON.stringify(c));")
-  done
-  if $json_out; then
-    node -e "
-console.log(JSON.stringify({
-  projectRoot: process.argv[1],
-  counts: JSON.parse(process.argv[2])
-}, null, 2));
-" -- "$PROJECT_ROOT" "$counts"
-  else
-    echo "Project root: $PROJECT_ROOT"
-    echo ""
-    for b in "${BUCKETS[@]}"; do
-      local n
-      n=$(node -e "console.log(JSON.parse(process.argv[1])['$b']||0)" -- "$counts")
-      printf '  %-13s %s\n' "$b/" "$n"
-    done
-    echo ""
-    echo "Buckets contain (most recent first):"
-    for b in "${BUCKETS[@]}"; do
-      local listed
-      listed=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | sort | head -10)
-      if [ -n "$listed" ]; then
-        echo "  $b/"
-        while IFS= read -r f; do
-          local rel="${f#$PROJECT_ROOT/$b/}"
-          echo "    $rel"
-        done <<< "$listed"
-        local total
-        total=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$total" -gt 10 ]; then
-          echo "    ... and $((total - 10)) more"
-        fi
-      fi
-    done
-  fi
-}
-
-cmd_clear() {
-  local clear_all=false yes=false
-  local -a wanted=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --all)         clear_all=true; shift ;;
-      --unvalidated) wanted+=(unvalidated); shift ;;
-      --validated)   wanted+=(validated); shift ;;
-      --partial)     wanted+=(partial); shift ;;
-      --failed)      wanted+=(failed); shift ;;
-      --yes|-y)      yes=true; shift ;;
-      -h|--help)     usage ;;
-      *)             echo "Unknown clear arg: $1" >&2; usage ;;
-    esac
-  done
-  if $clear_all; then
-    wanted=("${BUCKETS[@]}")
-  fi
-  if [ "${#wanted[@]}" -eq 0 ]; then
-    echo "clear: specify at least one of --all / --unvalidated / --validated / --partial / --failed" >&2
-    exit 2
-  fi
-
-  ensure_project_dirs
-
-  local total=0
-  echo "Will delete from:"
-  for b in "${wanted[@]}"; do
-    local n
-    n=$(find "$PROJECT_ROOT/$b" -type f -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
-    printf '  %-13s %s spec(s)\n' "$b/" "$n"
-    total=$((total + n))
-  done
-  if [ "$total" -eq 0 ]; then
-    echo "Nothing to delete."
-    exit 0
-  fi
-
-  if ! $yes; then
-    if [ -t 0 ]; then
-      printf 'Delete %d file(s)? [y/N] ' "$total" >&2
-      read -r yn
-      case "$yn" in [yY]|[yY][eE][sS]) ;; *) echo "Cancelled." >&2; exit 0 ;; esac
-    else
-      echo "Refusing to delete noninteractively without --yes." >&2
-      exit 2
-    fi
-  fi
-
-  for b in "${wanted[@]}"; do
-    find "$PROJECT_ROOT/$b" -type f -name '*.json' -delete 2>/dev/null || true
-    # Prune empty subdirs (Vendor/Product/ trees) but keep the bucket root + .gitkeep
-    find "$PROJECT_ROOT/$b" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-  done
-  echo "Cleared $total spec(s) from local buckets."
-  echo "Note: this only removes local files. Imported models on the IAP stack are unaffected."
-}
-
-# Restart the platform container to clear in-memory bloat that builds up after
-# many bulk runs (leaked global.config arrays, lingering sockets, etc.). Data
-# in mongo/redis is untouched — only the platform's Node process is recycled.
-# This is the lightest-weight fix when bulk starts crashing mid-run.
+# Restart the platform container to clear in-memory bloat that may build up after
+# many bulk runs.
+# Data in mongo/redis is untouched, only the platform's Node process is recycled.
 cmd_platform_reset() {
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      -h|--help) usage ;;
-      *) echo "Unknown platform-reset arg: $1" >&2; usage ;;
-    esac
-  done
+  case "${1:-}" in
+    -h|--help) usage ;;
+    "") ;;
+    *) echo "Unknown platform-reset arg: $1" >&2; usage ;;
+  esac
 
   if ! command -v docker >/dev/null 2>&1; then
     echo "platform-reset: 'docker' not found on PATH." >&2
-    echo "  This subcommand assumes a docker-based dev stack. If your IAP" >&2
-    echo "  runs elsewhere, restart the platform process by whatever means" >&2
-    echo "  your setup uses (systemd, pm2, etc.)." >&2
+    echo "  If your IAP runs elsewhere, restart the platform process by whatever" >&2
+    echo "  means your setup uses (systemd, pm2, etc.)." >&2
     exit 2
   fi
 
@@ -1265,12 +988,10 @@ cmd_platform_reset() {
 # --------- dispatch ---------
 SUB="${1:-}"
 case "$SUB" in
-  fetch)            shift; cmd_fetch "$@" ;;
-  bulk)             shift; cmd_bulk "$@" ;;
-  status)           shift; cmd_status "$@" ;;
-  clear)            shift; cmd_clear "$@" ;;
-  platform-reset)   shift; cmd_platform_reset "$@" ;;
+  fetch)          shift; cmd_fetch "$@" ;;
+  bulk)           shift; cmd_bulk "$@" ;;
+  platform-reset) shift; cmd_platform_reset "$@" ;;
   help|-h|--help) print_help; exit 0 ;;
-  "")      usage ;;
-  *)       cmd_single "$@" ;;
+  "")             usage ;;
+  *)              cmd_single "$@" ;;
 esac
