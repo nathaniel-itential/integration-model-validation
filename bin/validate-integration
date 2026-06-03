@@ -5,7 +5,6 @@
 #   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
 #   validate-integration fetch [--branch <name>]
 #   validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
-#   validate-integration platform-reset
 #
 # Exit codes:
 #   0 = PASS (single) or no failures (bulk/fetch)
@@ -28,7 +27,6 @@ Usage:
   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
   validate-integration fetch [--branch <name>]
   validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
-  validate-integration platform-reset
 
 Run 'validate-integration help' for examples and flag details.
 EOF
@@ -41,7 +39,6 @@ USAGE
   validate-integration <spec.json> [flags]    # validate one spec
   validate-integration fetch [--branch <name>] # pull specs from the assets repo
   validate-integration bulk [flags]            # validate every spec from fetch
-  validate-integration platform-reset          # restart the platform container
   validate-integration help                    # this screen
 
 FLAGS
@@ -63,10 +60,6 @@ FLAGS
 
     Bulk reads paths from validate-paths.json (written by 'fetch') in the current
     working directory and writes results to validate-report.json in the same directory.
-
-  platform-reset:
-    (no flags)        Runs 'docker restart <platform_container>' and waits up
-                      to 120s for the dev stack to become healthy again.
 
 STAGES (per spec)
   login           authenticate against the dev stack
@@ -100,7 +93,6 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
   "assets_branch": "$DEFAULT_ASSETS_BRANCH",
   "assets_cache_dir": "$DEFAULT_ASSETS_CACHE",
-  "platform_container": "platform"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -115,7 +107,6 @@ DOWNLOAD_PATH=$(node -e "const c=require('$CONFIG_FILE'); console.log((c.downloa
 ASSETS_REPO_URL=$(node -e "console.log(require('$CONFIG_FILE').assets_repo_url || '$DEFAULT_ASSETS_REPO_URL')")
 ASSETS_BRANCH=$(node -e "console.log(require('$CONFIG_FILE').assets_branch || '$DEFAULT_ASSETS_BRANCH')")
 ASSETS_CACHE_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_cache_dir||'$DEFAULT_ASSETS_CACHE')).replace(/^~/, process.env.HOME))")
-PLATFORM_CONTAINER=$(node -e "console.log(require('$CONFIG_FILE').platform_container || 'platform')")
 
 # Find the auto-created admin role for a given integration-model versionId.
 # Sorts using Mongo's _id so pages are stable if roles are added mid-scan.
@@ -830,8 +821,7 @@ cmd_bulk() {
         echo "Platform health check failed before next spec (sanity ping != HTTP 200)."
         echo "Progress so far:  PASS=$pass_count PARTIAL=$partial_count FAIL=$fail_count"
         echo ""
-        echo "Try:   validate-integration platform-reset"
-        echo "Then:  validate-integration bulk"
+        echo "Run 'make clean' on the dev stack to fully reset it before retrying."
         local aborted_ts aborted_done
         aborted_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
         aborted_done=$((pass_count + partial_count + fail_count))
@@ -934,62 +924,11 @@ console.log(JSON.stringify({
   exit 0
 }
 
-# Restart the platform container to clear in-memory bloat that may build up after
-# many bulk runs.
-# Data in mongo/redis is untouched, only the platform's Node process is recycled.
-cmd_platform_reset() {
-  case "${1:-}" in
-    -h|--help) usage ;;
-    "") ;;
-    *) echo "Unknown platform-reset arg: $1" >&2; usage ;;
-  esac
-
-  if ! command -v docker >/dev/null 2>&1; then
-    echo "platform-reset: 'docker' not found on PATH." >&2
-    echo "  If your IAP runs elsewhere, restart the platform process by whatever" >&2
-    echo "  means your setup uses (systemd, pm2, etc.)." >&2
-    exit 2
-  fi
-
-  if ! docker inspect "$PLATFORM_CONTAINER" >/dev/null 2>&1; then
-    echo "platform-reset: container '$PLATFORM_CONTAINER' not found." >&2
-    echo "  Edit 'platform_container' in $CONFIG_FILE if your container name differs." >&2
-    exit 2
-  fi
-
-  echo "Restarting container '$PLATFORM_CONTAINER'..."
-  if ! docker restart "$PLATFORM_CONTAINER" >/dev/null 2>&1; then
-    echo "platform-reset: 'docker restart $PLATFORM_CONTAINER' failed." >&2
-    exit 2
-  fi
-
-  printf "Waiting for the platform to become healthy"
-  local elapsed=0 max=120 code
-  while [ "$elapsed" -lt "$max" ]; do
-    code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 -X POST "$IAP_URL/login" \
-      -H "Content-Type: application/json" \
-      -d "{\"user\": {\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}}" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-      echo ""
-      echo "Platform healthy after ${elapsed}s."
-      return 0
-    fi
-    printf "."
-    sleep 2
-    elapsed=$((elapsed + 2))
-  done
-  echo ""
-  echo "platform-reset: platform did not become healthy within ${max}s." >&2
-  echo "  Check 'docker logs $PLATFORM_CONTAINER' for startup errors." >&2
-  exit 2
-}
-
 # --------- dispatch ---------
 SUB="${1:-}"
 case "$SUB" in
   fetch)          shift; cmd_fetch "$@" ;;
   bulk)           shift; cmd_bulk "$@" ;;
-  platform-reset) shift; cmd_platform_reset "$@" ;;
   help|-h|--help) print_help; exit 0 ;;
   "")             usage ;;
   *)              cmd_single "$@" ;;
