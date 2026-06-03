@@ -170,7 +170,6 @@ cleanup_one() {
   local local_token="$1" inst="$2" version="$3"
   # Delete instance first — instances reference the model and block its deletion.
   curl -s -o /dev/null -X DELETE "$IAP_URL/integrations/$inst" -H "Cookie: token=$local_token"
-  sleep 0.5
   local enc
   enc=$(node -e "console.log(encodeURIComponent(process.argv[1]))" -- "$version")
   curl -s -o /dev/null -X DELETE "$IAP_URL/integration-models/$enc" -H "Cookie: token=$local_token"
