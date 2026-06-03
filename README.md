@@ -50,16 +50,6 @@ validate-integration <spec.json> --cleanup              # delete instance + mode
 validate-integration <spec.json> --json                 # machine-readable output
 ```
 
-### Platform reset
-
-If a bulk run aborts with a health check failure:
-
-```bash
-validate-integration platform-reset
-```
-
-Restarts the Docker container and waits until the platform is healthy (~30s). MongoDB and Redis are untouched. If your container isn't named `platform`, set `platform_container` in `config.json`.
-
 ### From Claude Code
 
 ```
@@ -125,3 +115,6 @@ Re-run with `--group <name>` or set `default_group` in `config.json`. The error 
 
 **PARTIAL (methods X/Y)**  
 Some operations were dropped during import. Usually caused by duplicate or missing `operationId` values.
+
+**Bulk run aborts with health check failure**  
+The platform accumulates in-memory state across bulk runs. Run `make clean` on the dev stack to fully reset it before the next bulk run.
