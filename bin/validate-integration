@@ -227,20 +227,25 @@ console.log(n);
 const s=require('$spec_path');
 const schemes=(s.components||{}).securitySchemes||{};
 const entries=Object.entries(schemes);
-if (entries.length===0) { console.log('OK|no security schemes defined'); process.exit(0); }
+if (entries.length===0) { 
+  console.log('OK|no security schemes defined'); process.exit(0); 
+}
+
 const SUPPORTED=new Set(['apikey','http','oauth2','mutualtls','openidconnect']);
 const HTTP_OK=new Set(['basic','bearer']);
 const bad=[];
 const summary=[];
 const supported=[];
+
 for (const [name, sc] of entries) {
   const t=(sc.type||'').toLowerCase();
   if (!SUPPORTED.has(t)) {
     bad.push(\`'\${name}' uses unsupported type '\${sc.type||'(missing)'}'\`);
     continue;
   }
-  if (t==='http') {
-    const sub=(sc.scheme||'').toLowerCase();
+
+  if (t === 'http') {
+    const sub=(sc.scheme || '').toLowerCase();
     if (!HTTP_OK.has(sub)) {
       bad.push(\`'\${name}' is http but uses unsupported scheme '\${sc.scheme||'(missing)'}'\`);
       continue;
@@ -252,19 +257,32 @@ for (const [name, sc] of entries) {
     supported.push({name, display:sc.type});
   }
 }
-if (bad.length) { console.log('FAIL|'+bad.join('; ')); process.exit(0); }
+
+if (bad.length) { 
+  console.log('FAIL|'+bad.join('; ')); process.exit(0); 
+}
+
 const applied=new Set();
-for (const req of (s.security||[])) for (const k of Object.keys(req)) applied.add(k);
+for (const req of (s.security || [])) for (const k of Object.keys(req)) {
+  applied.add(k);
+}
+
 const verbs=new Set(['get','post','put','patch','delete','head','options']);
-for (const item of Object.values(s.paths||{})) {
-  for (const [v,op] of Object.entries(item)) {
-    if (!verbs.has(v)||!op||typeof op!=='object') continue;
-    for (const req of (op.security||[])) for (const k of Object.keys(req)) applied.add(k);
+for (const item of Object.values(s.paths || {})) {
+  for (const [v, op] of Object.entries(item)) {
+    if (!verbs.has(v) || !op || typeof op !== 'object') {
+      continue;
+    }
+    for (const req of (op.security||[])) for (const k of Object.keys(req)) {
+      applied.add(k);
+    }
   }
 }
 const unapplied=supported.filter(({name})=>!applied.has(name));
 const parts=[summary.join(', ')];
-for (const {name,display} of unapplied) parts.push(\`auth defined but unapplied: '\${name}' (\${display})\`);
+for (const {name,display} of unapplied) {
+  parts.push(\`auth defined but unapplied: '\${name}' (\${display})\`);
+}
 const status=unapplied.length===supported.length&&supported.length>0 ? 'FAIL' : 'OK';
 console.log(status+'|'+parts.join('; '));
 ")
