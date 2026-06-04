@@ -227,8 +227,13 @@ console.log(n);
 const s=require('$spec_path');
 const schemes=(s.components||{}).securitySchemes||{};
 const entries=Object.entries(schemes);
-if (entries.length===0) { 
-  console.log('OK|no security schemes defined'); process.exit(0); 
+if (entries.length===0) {
+  console.log('OK|no security schemes defined'); process.exit(0);
+}
+
+if (entries.length > 1) {
+  console.log('FAIL|Multiple security schemes defined, IAP only supports single security schemes');
+  process.exit(0);
 }
 
 const SUPPORTED=new Set(['apikey','http','oauth2','mutualtls','openidconnect']);
