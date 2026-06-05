@@ -1,4 +1,6 @@
 .DS_Store
+config.json
+test/
 *.log
 *.tmp
 node_modules/

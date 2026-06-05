@@ -13,7 +13,21 @@
 
 set -uo pipefail
 
-CONFIG_DIR="$HOME/.claude/skills/validate-integration"
+# Locate config relative to the script itself so it lives in the repo (dev) or
+# next to the installed binary (installed). Resolution order:
+#   1. config already exists next to the binary or one level up → use it
+#   2. parent dir has CLAUDE.md or install.sh → we're in a repo's bin/ → repo root
+#   3. otherwise → standalone install, config goes next to the binary
+_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)
+if [ -f "$_SELF_DIR/config.json" ]; then
+  CONFIG_DIR="$_SELF_DIR"
+elif [ -f "$_SELF_DIR/../config.json" ]; then
+  CONFIG_DIR=$(cd "$_SELF_DIR/.." && pwd)
+elif [ -f "$_SELF_DIR/../CLAUDE.md" ] || [ -f "$_SELF_DIR/../install.sh" ]; then
+  CONFIG_DIR=$(cd "$_SELF_DIR/.." && pwd)  # repo checkout — bootstrap at repo root
+else
+  CONFIG_DIR="$_SELF_DIR"                  # installed binary — bootstrap next to it
+fi
 CONFIG_FILE="$CONFIG_DIR/config.json"
 PATHS_FILE="$PWD/validate-paths.json"
 REPORT_FILE="$PWD/validate-report.json"
@@ -92,7 +106,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "download_path": "$HOME/Downloads",
   "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
   "assets_branch": "$DEFAULT_ASSETS_BRANCH",
-  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE",
+  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -100,6 +114,7 @@ EOF
 fi
 
 IAP_URL=$(node -e "console.log(require('$CONFIG_FILE').iap_url || '')")
+IAP_URL="${IAP_URL%/}"  # strip trailing slash to prevent double-slash in constructed URLs
 USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username || '')")
 PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password || '')")
 DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group || '')")
@@ -217,6 +232,14 @@ console.log(n);
 ")
   local instance_name
   instance_name=$(echo "$title" | tr '[:upper:] ' '[:lower:]-' | tr -cd '[:alnum:]-')
+
+  if [ "$SPEC_EXPECTED_OPS" -eq 0 ]; then
+    SPEC_VERDICT="FAIL"
+    SPEC_FAIL_STAGE="parse"
+    SPEC_FAIL_DETAIL="spec defines no operations"
+    SPEC_STAGES_JSON='[{"name":"parse","ok":false,"detail":"spec defines no operations"}]'
+    return 1
+  fi
 
   # Step 0.5: auth check
   # Verify the spec's components.securitySchemes only uses types Itential
@@ -682,6 +705,30 @@ cmd_single() {
   CLEANUP="$cleanup"
   JSON_OUT="$json_out"
 
+  # Pre-flight: catch zero-operation specs before spending a login round-trip.
+  local _pre_ops
+  _pre_ops=$(node -e "
+const s=require(process.argv[1]);
+const v=new Set(['get','post','put','patch','delete','head','options']);
+let n=0;
+for(const p of Object.values(s.paths||{})) for(const k of Object.keys(p)) if(v.has(k)) n++;
+console.log(n);
+" -- "$spec_path" 2>/dev/null || echo "0")
+  if [ "$_pre_ops" -eq 0 ]; then
+    local _pf='{"name":"parse","ok":false,"detail":"spec defines no operations"}'
+    if $JSON_OUT; then
+      node -e "console.log(JSON.stringify({spec:process.argv[1],verdict:'FAIL',stages:[JSON.parse(process.argv[2])]},null,2))" -- "$spec_path" "$_pf"
+    else
+      echo "=== Integration Validation Report ==="
+      echo "Spec:          $spec_path"
+      echo "Verdict:       FAIL"
+      echo ""
+      echo "Stage breakdown:"
+      echo "  [✗] parse            spec defines no operations"
+    fi
+    exit 1
+  fi
+
   if ! do_login; then
     if $JSON_OUT; then
       node -e "
@@ -759,7 +806,7 @@ cmd_fetch() {
     git -C "$ASSETS_CACHE_DIR" fetch --depth 1 origin "$branch" >/dev/null 2>&1 || {
       echo "git fetch failed; check network or repo access" >&2; exit 2;
     }
-    git -C "$ASSETS_CACHE_DIR" checkout -B "$branch" "origin/$branch" >/dev/null 2>&1 || {
+    git -C "$ASSETS_CACHE_DIR" checkout -B "$branch" FETCH_HEAD --force >/dev/null 2>&1 || {
       echo "git checkout $branch failed" >&2; exit 2;
     }
   else
@@ -811,10 +858,12 @@ cmd_bulk() {
     exit 2
   fi
 
-  local paths_array
-  paths_array=$(cat "$PATHS_FILE")
   local n_total
-  n_total=$(echo "$paths_array" | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf-8')).length)")
+  n_total=$(node -e "
+const raw=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8'));
+const paths=Array.isArray(raw)?raw:[raw];
+console.log(paths.length);
+" -- "$PATHS_FILE")
 
   if [ "$n_total" -eq 0 ]; then
     echo "No specs in paths file." >&2
@@ -909,10 +958,11 @@ console.log(JSON.stringify(arr));
 " -- "$results_json" "$spec_path" "$SPEC_VERSION_ID" "$SPEC_VERDICT" \
   "$SPEC_EXPECTED_OPS" "${SPEC_ACTUAL_METHODS:-}" "${SPEC_FAIL_STAGE:-}" "${SPEC_FAIL_DETAIL:-}")
 
-  done < <(echo "$paths_array" | node -e "
-const paths=JSON.parse(require('fs').readFileSync(0,'utf-8'));
+  done < <(node -e "
+const raw=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8'));
+const paths=Array.isArray(raw)?raw:[raw];
 console.log(paths.join('\n'));
-")
+" -- "$PATHS_FILE")
 
   echo ""
   echo "=== Bulk Summary ==="

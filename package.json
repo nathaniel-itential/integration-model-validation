@@ -1,0 +1,11 @@
+{
+  "name": "integration-model-validation",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test": "bash test/test-validate-integration.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

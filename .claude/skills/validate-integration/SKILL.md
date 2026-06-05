@@ -1,7 +1,7 @@
 ---
 name: validate-integration
 description: Run the full Itential integration-model validation pipeline against a local dev stack — imports an OpenAPI spec, creates the instance, grants the auto-created role to a group, and confirms every operation became a callable task. Also pulls OpenAPI specs from the itential/assets repo for bulk validation. Replaces the manual import → create → authorize → open Studio → check sidebar workflow. Use when the user wants to verify an OpenAPI spec produces a working integration without manually clicking through the UI.
-argument-hint: "<spec.json> [flags]  |  fetch [--branch <name>]  |  bulk [--no-cleanup] [--throttle <s>]  |  platform-reset"
+argument-hint: "<spec.json> [flags]  |  fetch [--branch <name>]  |  bulk [--no-cleanup] [--throttle <s>]"
 ---
 
 # Integration Model Validation
@@ -12,7 +12,7 @@ This skill is a thin wrapper around the `validate-integration` CLI installed at 
 
 - `validate-integration` is on the user's `PATH`. If `command -v validate-integration` returns nothing, the user needs to run the project's `install.sh`.
 - The local IAP dev stack is running and reachable (only needed for single/bulk modes; `fetch` doesn't touch the dev stack).
-- A config file exists at `~/.claude/skills/validate-integration/config.json`. `install.sh` creates and migrates it; only edit if the user's setup differs from the team defaults.
+- A config file exists at `~/.local/bin/config.json` (next to the installed binary). `install.sh` creates and migrates it; only edit if the user's setup differs from the team defaults.
 
 ## Subcommands
 
@@ -20,7 +20,6 @@ This skill is a thin wrapper around the `validate-integration` CLI installed at 
 validate-integration <spec.json> [--cleanup] [--group <name>] [--json]   # single spec
 validate-integration fetch [--branch <name>]                              # pull specs from the assets repo
 validate-integration bulk [--no-cleanup] [--throttle <s>] [--group <name>]
-validate-integration platform-reset
 ```
 
 The CLI exits with:
@@ -35,7 +34,6 @@ The CLI exits with:
 | "validate this spec at /path/to/foo.json" | `validate-integration /path/to/foo.json` |
 | "pull specs from the assets repo" | `validate-integration fetch` |
 | "validate all fetched specs" | `validate-integration bulk` |
-| "the platform is sluggish / bulk crashed" | `validate-integration platform-reset` |
 
 ## Procedure per subcommand
 
@@ -52,9 +50,6 @@ Bulk cleans up each imported model + instance after validating by default — pa
 
 After bulk completes, the JSON report at `validate-report.json` contains the full results. If `FAIL > 0`, offer to dig into a specific failed spec by running it in single-spec mode for the full stage-by-stage report.
 
-### platform-reset
-Runs `docker restart <platform_container>` and polls until the platform is healthy. Use when bulk aborts with "Platform health check failed" — this clears in-memory state that accumulates across many runs. MongoDB and Redis are untouched.
-
 ## Presenting results
 
 ### Single-spec verdicts
@@ -67,7 +62,7 @@ Runs `docker restart <platform_container>` and polls until the platform is healt
   - `must NOT have additional properties` on `parse`/`encode`/`encrypt` → adapter-generated spec. Strip non-standard fields.
   - `exclusiveMinimum must be number` → JSON Schema Draft 4 boolean form (NetBox 4.x, older drf-spectacular). Convert to number form.
 - **FAIL at `authz`** with "group not found" — error lists available groups. Suggest `--group <correct>` or edit `default_group` in `config.json`.
-- **FAIL at `login`** — wrong credentials or URL. Tell the user to check `~/.claude/skills/validate-integration/config.json`.
+- **FAIL at `login`** — wrong credentials or URL. Tell the user to check `~/.local/bin/config.json`.
 
 ### Bulk verdicts
 The CLI prints one line per spec with `[✓]` (pass), `[~]` (partial), `[✗]` (fail), then a summary and the path to `validate-report.json`. Highlight any failures and offer to re-run a specific failed spec in single-spec mode for the full report.

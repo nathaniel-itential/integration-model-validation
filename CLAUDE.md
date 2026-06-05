@@ -19,9 +19,8 @@ This repo contains a CLI + Claude Code skill that runs the full Itential integra
 | Command | What it does |
 |---|---|
 | `validate-integration <spec.json>` | Single-spec mode. Validates one spec and prints a full stage-by-stage report. |
-| `validate-integration fetch [--branch <name>]` | Clones/pulls `github.com/itential/assets` to a local cache, discovers all `*/OpenAPIs/*.json` files, and writes their absolute paths to `~/.claude/skills/validate-integration/validate-paths.json`. |
+| `validate-integration fetch [--branch <name>]` | Clones/pulls `github.com/itential/assets` to a local cache, discovers all `*/OpenAPIs/*.json` files, and writes their absolute paths to `validate-paths.json` in the current working directory. |
 | `validate-integration bulk` | Reads paths from `validate-paths.json` (written by `fetch`), validates each spec, prints progress to the terminal, and writes a full JSON report to `validate-report.json` in the same directory. |
-| `validate-integration platform-reset` | Restarts the platform Docker container to clear in-memory state that accumulates across many bulk runs. |
 
 ## Output files (written to the current working directory)
 

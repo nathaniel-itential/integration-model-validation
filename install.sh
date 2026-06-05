@@ -12,6 +12,7 @@ set -euo pipefail
 SKILL_DIR="$HOME/.claude/skills/validate-integration"
 BIN_DIR="$HOME/.local/bin"
 BIN_PATH="$BIN_DIR/validate-integration"
+CONFIG_FILE="$BIN_DIR/config.json"
 
 # --------- find sources (must be run from inside the repo) ---------
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")
@@ -37,7 +38,15 @@ install -m 0644 "$REPO_BASE/.claude/skills/validate-integration/SKILL.md" "$SKIL
 echo "Installed skill:  $SKILL_DIR/SKILL.md"
 
 # --------- bootstrap / migrate config ---------
-CONFIG_FILE="$SKILL_DIR/config.json"
+# Config lives next to the binary so the script can find it via its own location.
+# Migrate from the old ~/.claude/skills location if present and the new one doesn't exist yet.
+OLD_CONFIG="$SKILL_DIR/config.json"
+if [ ! -f "$CONFIG_FILE" ] && [ -f "$OLD_CONFIG" ]; then
+  cp "$OLD_CONFIG" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  echo "Migrated config:  $OLD_CONFIG → $CONFIG_FILE"
+fi
+
 DEFAULTS_JSON=$(cat <<EOF
 {
   "iap_url": "http://localhost:3000",
