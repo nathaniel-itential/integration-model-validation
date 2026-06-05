@@ -12,7 +12,7 @@ Validates OpenAPI specs against a local Itential dev stack — confirms every op
 git clone https://github.com/nathaniel-itential/integration-model-validation.git
 cd integration-model-validation
 ./install.sh
-$EDITOR ~/.claude/skills/validate-integration/config.json  # set your IAP URL + credentials
+$EDITOR ~/.local/bin/config.json  # set your IAP URL + credentials
 validate-integration fetch
 validate-integration bulk
 ```
@@ -22,8 +22,8 @@ validate-integration bulk
 | File | Purpose |
 |---|---|
 | `~/.local/bin/validate-integration` | The CLI |
+| `~/.local/bin/config.json` | Connection config |
 | `~/.claude/skills/validate-integration/SKILL.md` | Claude Code skill (`/validate-integration`) |
-| `~/.claude/skills/validate-integration/config.json` | Connection config |
 
 ## Usage
 
@@ -61,7 +61,7 @@ validate-integration <spec.json> --json                 # machine-readable outpu
 
 ## Config
 
-`~/.claude/skills/validate-integration/config.json`:
+`~/.local/bin/config.json`:
 
 ```json
 {
@@ -69,8 +69,9 @@ validate-integration <spec.json> --json                 # machine-readable outpu
   "username": "admin@itential",
   "password": "admin",
   "default_group": "admin_group",
+  "assets_repo_url": "https://github.com/itential/assets.git",
   "assets_branch": "add-openapi-specs",
-  "platform_container": "platform"
+  "assets_cache_dir": "~/.cache/itential-assets"
 }
 ```
 
