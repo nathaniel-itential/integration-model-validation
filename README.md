@@ -39,7 +39,8 @@ validate-integration bulk --throttle 2      # pause 2s between specs
 ```
 
 `fetch` writes spec paths to `validate-paths.json` in the current directory.  
-`bulk` reads from that file and writes results to `validate-report.json` in the current directory.
+`bulk` reads from that file and writes results to `validate-report.json` in the current directory.  
+Paths can also be written manually into `validate-paths.json` and executed with `validate-integration bulk`.
 
 ### Single spec
 
