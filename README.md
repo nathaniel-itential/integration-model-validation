@@ -80,7 +80,7 @@ Re-running `install.sh` updates the config in place — your values are preserve
 | Stage | What it checks |
 |---|---|
 | `login` | Credentials and connectivity |
-| `auth-check` | Security schemes use supported types and are applied to operations |
+| `auth-check` | Security schemes use supported types, are applied to operations and only one scheme declared |
 | `import` | Platform accepts the spec |
 | `instance` | A virtual instance can be created from the model |
 | `role-discovery` | Platform auto-created an admin role for the integration |
