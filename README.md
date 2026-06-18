@@ -12,7 +12,7 @@ Validates OpenAPI specs against a local Itential dev stack — confirms every op
 git clone https://github.com/nathaniel-itential/integration-model-validation.git
 cd integration-model-validation
 ./install.sh
-$EDITOR ~/.local/bin/config.json  # set your IAP URL + credentials
+$EDITOR ~/.local/bin/config.json  # set your IAP URL, credentials, and assets_dir
 validate-integration fetch
 validate-integration bulk
 ```
@@ -30,15 +30,13 @@ validate-integration bulk
 ### Fetch + bulk
 
 ```bash
-validate-integration fetch                  # pull specs from github.com/itential/assets
-validate-integration fetch --branch main    # use a specific branch
+validate-integration fetch             # index specs from the configured assets_dir folder
 
-validate-integration bulk                   # validate all fetched specs
-validate-integration bulk --no-cleanup      # keep imported models after each spec
-validate-integration bulk --throttle 2      # pause 2s between specs
+validate-integration bulk              # validate all fetched specs
+validate-integration bulk --no-cleanup # keep imported models after each spec
 ```
 
-`fetch` writes spec paths to `validate-paths.json` in the current directory.  
+`fetch` scans the `assets_dir` folder (configured in `config.json`) for `*.json` files one level deep and writes their absolute paths to `validate-paths.json` in the current directory.  
 `bulk` reads from that file and writes results to `validate-report.json` in the current directory.  
 Paths can also be written manually into `validate-paths.json` and executed with `validate-integration bulk`.
 
@@ -69,20 +67,18 @@ validate-integration <spec.json> --json                 # machine-readable outpu
   "username": "admin@itential",
   "password": "admin",
   "default_group": "admin_group",
-  "assets_repo_url": "https://github.com/itential/assets.git",
-  "assets_branch": "add-openapi-specs",
-  "assets_cache_dir": "~/.cache/itential-assets"
+  "assets_dir": "~/.cache/itential-openapi-specs"
 }
 ```
 
-Re-running `install.sh` updates the config in place — your values are preserved.
+`assets_dir` should point to a flat folder of OpenAPI spec JSON files. Re-running `install.sh` updates the config in place — your values are preserved.
 
 ## Validation stages
 
 | Stage | What it checks |
 |---|---|
 | `login` | Credentials and connectivity |
-| `auth-check` | Security schemes use supported types, are applied to operations and only one scheme declared |
+| `auth-check` | Security schemes use supported types, are applied to operations, and only one scheme is declared |
 | `import` | Platform accepts the spec |
 | `instance` | A virtual instance can be created from the model |
 | `role-discovery` | Platform auto-created an admin role for the integration |
@@ -102,6 +98,9 @@ Add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc file.
 
 **Login failed (exit 2)**  
 Check that your dev stack is running and that the URL and credentials in `config.json` are correct.
+
+**fetch returns 0 specs**  
+Check that `assets_dir` in `config.json` points to a folder containing `*.json` files.
 
 **FAIL at `auth-check`: auth defined but unapplied**  
 The spec defines security schemes but no operations reference them. Add a top-level `security` block.
