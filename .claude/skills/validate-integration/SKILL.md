@@ -1,7 +1,7 @@
 ---
 name: validate-integration
 description: Run the full Itential integration-model validation pipeline against a local dev stack — imports an OpenAPI spec, creates the instance, grants the auto-created role to a group, and confirms every operation became a callable task. Also pulls OpenAPI specs from the itential/assets repo for bulk validation. Replaces the manual import → create → authorize → open Studio → check sidebar workflow. Use when the user wants to verify an OpenAPI spec produces a working integration without manually clicking through the UI.
-argument-hint: "<spec.json> [flags]  |  fetch [--branch <name>]  |  bulk [--no-cleanup] [--throttle <s>]"
+argument-hint: "<spec.json> [flags]  |  fetch  |  bulk [--no-cleanup]"
 ---
 
 # Integration Model Validation
@@ -18,8 +18,8 @@ This skill is a thin wrapper around the `validate-integration` CLI installed at 
 
 ```bash
 validate-integration <spec.json> [--cleanup] [--group <name>] [--json]   # single spec
-validate-integration fetch [--branch <name>]                              # pull specs from the assets repo
-validate-integration bulk [--no-cleanup] [--throttle <s>] [--group <name>]
+validate-integration fetch                                                # index specs from assets_dir
+validate-integration bulk [--no-cleanup] [--group <name>]
 ```
 
 The CLI exits with:
@@ -41,12 +41,12 @@ The CLI exits with:
 Invoke the CLI with whatever path the user provided.
 
 ### fetch
-Just run it. The CLI clones/pulls a cached copy of `github.com/itential/assets` (branch configured in `config.json`) and writes all discovered spec paths to `validate-paths.json` in the current working directory. Print the count and path written.
+Just run it. The CLI scans the `assets_dir` folder configured in `config.json` for `*.json` files (one level deep) and writes their absolute paths to `validate-paths.json` in the current working directory. Print the count and path written.
 
 ### bulk
 Run it. The CLI reads paths from `validate-paths.json` (written by `fetch`), validates each spec, prints one progress line per spec to the terminal, and writes a full JSON report to `validate-report.json` in the current working directory.
 
-Bulk cleans up each imported model + instance after validating by default — pass `--no-cleanup` to keep them. Between specs, bulk runs a platform health check. If the dev stack stops responding mid-batch, bulk aborts cleanly with a progress summary. Suggest bumping `--throttle` to 1–3 if the user reports import HTTP 404 or HTTP 000 errors mid-run.
+Bulk cleans up each imported model + instance after validating by default — pass `--no-cleanup` to keep them. Between specs, bulk runs a platform health check. If the dev stack stops responding mid-batch, bulk aborts cleanly with a progress summary.
 
 After bulk completes, the JSON report at `validate-report.json` contains the full results. If `FAIL > 0`, offer to dig into a specific failed spec by running it in single-spec mode for the full stage-by-stage report.
 

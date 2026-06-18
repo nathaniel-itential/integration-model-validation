@@ -54,9 +54,7 @@ DEFAULTS_JSON=$(cat <<EOF
   "password": "admin",
   "default_group": "admin_group",
   "download_path": "$HOME/Downloads",
-  "assets_repo_url": "https://github.com/itential/assets.git",
-  "assets_branch": "add-openapi-specs",
-  "assets_cache_dir": "$HOME/.cache/itential-assets",
+  "assets_dir": "$HOME/.cache/itential-assets",
   "platform_container": "platform"
 }
 EOF
@@ -97,7 +95,7 @@ esac
 # --------- next steps ---------
 echo ""
 echo "Done. Try it:"
-echo "  validate-integration fetch                             # pull specs from the assets repo"
+echo "  validate-integration fetch                             # index specs from the assets_dir folder"
 echo "  validate-integration bulk                             # validate all fetched specs"
 echo "  validate-integration /path/to/your/openapi.json      # single spec"
 echo ""

@@ -3,8 +3,8 @@
 #
 # Usage:
 #   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
-#   validate-integration fetch [--branch <name>]
-#   validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
+#   validate-integration fetch
+#   validate-integration bulk  [--no-cleanup] [--group <name>]
 #
 # Exit codes:
 #   0 = PASS (single) or no failures (bulk/fetch)
@@ -31,16 +31,14 @@ fi
 CONFIG_FILE="$CONFIG_DIR/config.json"
 PATHS_FILE="$PWD/validate-paths.json"
 REPORT_FILE="$PWD/validate-report.json"
-DEFAULT_ASSETS_CACHE="$HOME/.cache/itential-assets"
-DEFAULT_ASSETS_REPO_URL="https://github.com/itential/assets.git"
-DEFAULT_ASSETS_BRANCH="add-openapi-specs"
+DEFAULT_ASSETS_DIR="$HOME/.cache/itential-assets"
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
   validate-integration <spec.json> [--cleanup] [--group <name>] [--json]
-  validate-integration fetch [--branch <name>]
-  validate-integration bulk  [--no-cleanup] [--throttle <s>] [--group <name>]
+  validate-integration fetch
+  validate-integration bulk  [--no-cleanup] [--group <name>]
 
 Run 'validate-integration help' for examples and flag details.
 EOF
@@ -51,9 +49,9 @@ print_help() {
   cat <<'EOF'
 USAGE
   validate-integration <spec.json> [flags]    # validate one spec
-  validate-integration fetch [--branch <name>] # pull specs from the assets repo
-  validate-integration bulk [flags]            # validate every spec from fetch
-  validate-integration help                    # this screen
+  validate-integration fetch                  # index specs from the assets_dir folder
+  validate-integration bulk [flags]           # validate every spec from fetch
+  validate-integration help                   # this screen
 
 FLAGS
   Single-spec mode:
@@ -61,15 +59,9 @@ FLAGS
     --group <name>    Grant the role to this group (default: from config)
     --json            Emit JSON instead of the formatted report
 
-  fetch:
-    --branch <name>   Use a non-default branch of the assets repo
-
   bulk:
     --no-cleanup      Keep imported models + instances after each spec
                       (cleanup is ON by default in bulk)
-    --throttle <s>    Seconds to pause between specs (default: 0). Bump
-                      to 1–3 if the platform starts returning HTTP 404 or
-                      000 on import mid-run.
     --group <name>    Group override for all specs in the batch
 
     Bulk reads paths from validate-paths.json (written by 'fetch') in the current
@@ -104,9 +96,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
   "password": "admin",
   "default_group": "admin_group",
   "download_path": "$HOME/Downloads",
-  "assets_repo_url": "$DEFAULT_ASSETS_REPO_URL",
-  "assets_branch": "$DEFAULT_ASSETS_BRANCH",
-  "assets_cache_dir": "$DEFAULT_ASSETS_CACHE"
+  "assets_dir": "$DEFAULT_ASSETS_DIR"
 }
 EOF
   chmod 600 "$CONFIG_FILE"
@@ -119,9 +109,7 @@ USERNAME=$(node -e "console.log(require('$CONFIG_FILE').username || '')")
 PASSWORD=$(node -e "console.log(require('$CONFIG_FILE').password || '')")
 DEFAULT_GROUP=$(node -e "console.log(require('$CONFIG_FILE').default_group || '')")
 DOWNLOAD_PATH=$(node -e "const c=require('$CONFIG_FILE'); console.log((c.download_path||'').replace(/^~/, process.env.HOME))")
-ASSETS_REPO_URL=$(node -e "console.log(require('$CONFIG_FILE').assets_repo_url || '$DEFAULT_ASSETS_REPO_URL')")
-ASSETS_BRANCH=$(node -e "console.log(require('$CONFIG_FILE').assets_branch || '$DEFAULT_ASSETS_BRANCH')")
-ASSETS_CACHE_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_cache_dir||'$DEFAULT_ASSETS_CACHE')).replace(/^~/, process.env.HOME))")
+ASSETS_DIR=$(node -e "const c=require('$CONFIG_FILE'); console.log(((c.assets_dir||'$DEFAULT_ASSETS_DIR')).replace(/^~/, process.env.HOME))")
 
 # Find the auto-created admin role for a given integration-model versionId.
 # Sorts using Mongo's _id so pages are stable if roles are added mid-scan.
@@ -196,6 +184,8 @@ cleanup_one() {
 validate_one_spec() {
   local spec_path="$1" token="$2"
   SPEC_VERDICT=""
+  SPEC_VERSION_ID=""
+  SPEC_EXPECTED_OPS=""
   SPEC_FAIL_STAGE=""
   SPEC_FAIL_DETAIL=""
   SPEC_ACTUAL_METHODS=""
@@ -582,22 +572,10 @@ write_report_md() {
   node -e "
 const report=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8'));
 const s=report.summary;
-const SKIP=new Set(['assets','itential-assets']);
 function label(spec,vid){
-  const parts=(spec||'').split('/');
-  const idx=parts.lastIndexOf('OpenAPIs');
-  const file=parts[parts.length-1]||'—';
-  let product='—';
-  if(idx>0){
-    const vp=[];
-    for(let i=idx-1;i>=0&&vp.length<2;i--){
-      if(!SKIP.has(parts[i]))vp.unshift(parts[i]);
-      else break;
-    }
-    product=vp.join(' / ')||parts[idx-1];
-  }
+  const file=require('path').basename(spec||'')||'—';
   const title=vid?vid.split(':').slice(0,-1).join(':'):file;
-  return {product,title};
+  return title;
 }
 function esc(s){return String(s).replace(/\|/g,'\\|');}
 const lines=[];
@@ -614,24 +592,24 @@ lines.push('**Results:** '+s.pass+' PASS · '+s.partial+' PARTIAL · '+s.fail+' 
 lines.push('');
 lines.push('## Results');
 lines.push('');
-lines.push('| Product | Spec | Result |');
-lines.push('|---------|------|--------|');
+lines.push('| Spec | Result |');
+lines.push('|------|--------|');
 for(const r of report.results){
-  const {product,title}=label(r.spec,r.versionId);
+  const title=label(r.spec,r.versionId);
   let result;
   if(r.verdict==='PASS') result='✓ PASS ('+r.actualMethods+'/'+r.expectedOps+')';
   else if(r.verdict==='PARTIAL') result='~ PARTIAL ('+r.actualMethods+'/'+r.expectedOps+')';
   else result='✗ FAIL';
-  lines.push('| '+esc(product)+' | '+esc(title)+' | '+result+' |');
+  lines.push('| '+esc(title)+' | '+result+' |');
 }
 const failures=report.results.filter(r=>r.verdict!=='PASS');
 if(failures.length>0){
   lines.push('');
   lines.push('## Failures');
   for(const r of failures){
-    const {product,title}=label(r.spec,r.versionId);
+    const title=label(r.spec,r.versionId);
     lines.push('');
-    lines.push('### '+esc(product)+' — '+esc(title));
+    lines.push('### '+esc(title));
     if(r.verdict==='PARTIAL'){
       lines.push('**Result:** PARTIAL — '+r.actualMethods+' of '+r.expectedOps+' operations callable');
     } else {
@@ -785,46 +763,25 @@ console.log(JSON.stringify({
   [ "$SPEC_VERDICT" = "PASS" ] && exit 0 || exit 1
 }
 
-#Fetch command, pulls spec paths from local git repo and branch specified in config
-#Puts paths into validate-paths to be validated by the validate-bulk command
+#Fetch command, scans the assets_dir folder for JSON specs and writes their paths
+#to validate-paths.json to be validated by the validate-bulk command
 cmd_fetch() {
-  local branch_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
-      --branch) branch_override="${2:-}"; shift 2 ;;
       -h|--help) usage ;;
       -*) echo "Unknown flag: $1" >&2; usage ;;
       *)  echo "Unknown arg: $1" >&2; usage ;;
     esac
   done
-  local branch="${branch_override:-$ASSETS_BRANCH}"
 
-  mkdir -p "$(dirname "$ASSETS_CACHE_DIR")"
-
-  if [ -d "$ASSETS_CACHE_DIR/.git" ]; then
-    echo "Updating asset cache at $ASSETS_CACHE_DIR (branch $branch)..." >&2
-    git -C "$ASSETS_CACHE_DIR" fetch --depth 1 origin "$branch" >/dev/null 2>&1 || {
-      echo "git fetch failed; check network or repo access" >&2; exit 2;
-    }
-    git -C "$ASSETS_CACHE_DIR" checkout -B "$branch" FETCH_HEAD --force >/dev/null 2>&1 || {
-      echo "git checkout $branch failed" >&2; exit 2;
-    }
-  else
-    echo "Cloning $ASSETS_REPO_URL (branch $branch) to $ASSETS_CACHE_DIR..." >&2
-    git clone --depth 1 --branch "$branch" "$ASSETS_REPO_URL" "$ASSETS_CACHE_DIR" >/dev/null 2>&1 || {
-      echo "git clone failed; check network or repo access" >&2; exit 2;
-    }
-  fi
-
-  local search_root
-  if [ -d "$ASSETS_CACHE_DIR/assets" ]; then
-    search_root="$ASSETS_CACHE_DIR/assets"
-  else
-    search_root="$ASSETS_CACHE_DIR"
+  if [ ! -d "$ASSETS_DIR" ]; then
+    echo "Assets directory not found: $ASSETS_DIR" >&2
+    echo "Set 'assets_dir' in $CONFIG_FILE to a folder containing OpenAPI spec JSON files." >&2
+    exit 2
   fi
 
   local paths_json
-  paths_json=$(find "$search_root" -type f -name '*.json' -path '*/OpenAPIs/*' 2>/dev/null | sort | node -e "
+  paths_json=$(find "$ASSETS_DIR" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort | node -e "
 const lines=require('fs').readFileSync(0,'utf-8').trim().split('\n').filter(Boolean);
 console.log(JSON.stringify(lines, null, 2));
 ")
@@ -833,18 +790,17 @@ console.log(JSON.stringify(lines, null, 2));
   count=$(echo "$paths_json" | node -e "console.log(JSON.parse(require('fs').readFileSync(0,'utf-8')).length)")
 
   echo "$paths_json" > "$PATHS_FILE"
-  echo "Found $count spec(s). Paths written to $PATHS_FILE."
+  echo "Found $count spec(s) in $ASSETS_DIR. Paths written to $PATHS_FILE."
 }
 
 #Bulk validation, pulls from validate-paths.json populated by the fetch request
 cmd_bulk() {
   # Bulk defaults to cleanup=true
-  local cleanup=true group_override="" throttle="0"
+  local cleanup=true group_override=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-cleanup) cleanup=false; shift ;;
       --cleanup)    cleanup=true; shift ;;
-      --throttle)   throttle="${2:-1}"; shift 2 ;;
       --group)      group_override="${2:-}"; shift 2 ;;
       -h|--help)    usage ;;
       *)            echo "Unknown bulk arg: $1" >&2; usage ;;
@@ -886,7 +842,6 @@ console.log(paths.length);
   while IFS= read -r spec_path; do
     [ -z "$spec_path" ] && continue
     if [ "$iter" -gt 0 ]; then
-      sleep "$throttle"
       if ! platform_health "$LOGIN_TOKEN"; then
         echo ""
         echo "=== Bulk aborted ==="
@@ -933,13 +888,7 @@ console.log(JSON.stringify({
       *)       summary="FAIL @${SPEC_FAIL_STAGE}: ${SPEC_FAIL_DETAIL}" ;;
     esac
 
-    label=$(echo "$spec_path" | node -e "
-const p=require('fs').readFileSync(0,'utf-8').trim();
-const parts=p.split('/');
-const idx=parts.lastIndexOf('OpenAPIs');
-if(idx>=1) process.stdout.write(parts.slice(idx-1).join('/'));
-else process.stdout.write(parts.slice(-2).join('/'));
-")
+    label=$(node -e "process.stdout.write(require('path').basename(process.argv[1]))" -- "$spec_path")
     printf '  [%s] %-50s %s\n' "$mark" "$label" "$summary"
 
     results_json=$(node -e "
